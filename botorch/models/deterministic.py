@@ -1,29 +1,46 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
 r"""
-Deterministic Models. Simple wrappers that allow the usage of deterministic
-mappings via the BoTorch Model and Posterior APIs. Useful e.g. for defining
-known cost functions for cost-aware acquisition utilities.
+Deterministic Models: Simple wrappers that allow the usage of deterministic
+mappings via the BoTorch Model and Posterior APIs.
+
+Deterministic models are useful for expressing known input-output relationships
+within the BoTorch Model API. This is useful e.g. for multi-objective
+optimization with known objective functions (e.g. the number of parameters of a
+Neural Network in the context of Neural Architecture Search is usually a known
+function of the architecture configuration), or to encode cost functions for
+cost-aware acquisition utilities. Cost-aware optimization is desirable when
+evaluations have a cost that is heterogeneous, either in the inputs `X` or in a
+particular fidelity parameter that directly encodes the fidelity of the
+observation. `GenericDeterministicModel` supports arbitrary deterministic
+functions, while `AffineFidelityCostModel` is a particular cost model for
+multi-fidelity optimization. Other use cases of deterministic models include
+representing approximate GP sample paths, e.g. random Fourier features obtained
+with `get_gp_samples`, which allows them to be substituted in acquisition
+functions or in other places where a `Model` is expected.
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any, Callable, List, Optional, Union
+from abc import abstractmethod
+from typing import Callable, List, Optional, Union
 
 import torch
-from botorch.exceptions.errors import UnsupportedError
+from botorch.models.ensemble import EnsembleModel
 from botorch.models.model import Model
-from botorch.posteriors.deterministic import DeterministicPosterior
 from torch import Tensor
 
 
-class DeterministicModel(Model, ABC):
-    r"""Abstract base class for deterministic models."""
+class DeterministicModel(EnsembleModel):
+    r"""
+    Abstract base class for deterministic models.
+
+    :meta private:
+    """
 
     @abstractmethod
     def forward(self, X: Tensor) -> Tensor:
@@ -38,32 +55,21 @@ class DeterministicModel(Model, ABC):
         """
         pass  # pragma: no cover
 
-    @property
-    def num_outputs(self) -> int:
-        r"""The number of outputs of the model."""
-        return self._num_outputs
-
-    def posterior(
-        self, X: Tensor, output_indices: Optional[List[int]] = None, **kwargs: Any
-    ) -> DeterministicPosterior:
-        r"""Compute the (deterministic) posterior at X."""
-        if kwargs.get("observation_noise") is not None:
-            # TODO: Consider returning an MVN here instead
-            raise UnsupportedError(
-                "Deterministic models do not support observation noise."
-            )
-        values = self.forward(X)
-        if output_indices is not None:
-            values = values[..., output_indices]
-        return DeterministicPosterior(values=values)
+    def _forward(self, X: Tensor) -> Tensor:
+        r"""Compatibilizes the `DeterministicModel` with `EnsemblePosterior`"""
+        return self.forward(X=X).unsqueeze(-3)
 
 
 class GenericDeterministicModel(DeterministicModel):
-    r"""A generic deterministic model constructed from a callable."""
+    r"""A generic deterministic model constructed from a callable.
+
+    Example:
+        >>> f = lambda x: x.sum(dim=-1, keep_dims=True)
+        >>> model = GenericDeterministicModel(f)
+    """
 
     def __init__(self, f: Callable[[Tensor], Tensor], num_outputs: int = 1) -> None:
-        r"""A generic deterministic model constructed from a callable.
-
+        r"""
         Args:
             f: A callable mapping a `batch_shape x n x d`-dim input tensor `X`
                 to a `batch_shape x n x m`-dimensional output tensor (the
@@ -87,7 +93,7 @@ class GenericDeterministicModel(DeterministicModel):
         def f_subset(X: Tensor) -> Tensor:
             return self._f(X)[..., idcs]
 
-        return self.__class__(f=f_subset)
+        return self.__class__(f=f_subset, num_outputs=len(idcs))
 
     def forward(self, X: Tensor) -> Tensor:
         r"""Compute the (deterministic) model output at X.
@@ -144,3 +150,67 @@ class AffineDeterministicModel(DeterministicModel):
 
     def forward(self, X: Tensor) -> Tensor:
         return self.b + torch.einsum("...d,dm", X, self.a)
+
+
+class PosteriorMeanModel(DeterministicModel):
+    """A deterministic model that always returns the posterior mean."""
+
+    def __init__(self, model: Model) -> None:
+        r"""
+        Args:
+            model: The base model.
+        """
+        super().__init__()
+        self.model = model
+
+    def forward(self, X: Tensor) -> Tensor:
+        return self.model.posterior(X).mean
+
+
+class FixedSingleSampleModel(DeterministicModel):
+    r"""
+    A deterministic model defined by a single sample `w`.
+
+    Given a base model `f` and a fixed sample `w`, the model always outputs
+
+        y = f_mean(x) + f_stddev(x) * w
+
+    We assume the outcomes are uncorrelated here.
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        w: Optional[Tensor] = None,
+        dim: Optional[int] = None,
+        jitter: Optional[float] = 1e-8,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.dtype] = None,
+    ) -> None:
+        r"""
+        Args:
+            model: The base model.
+            w: A 1-d tensor with length model.num_outputs.
+                If None, draw it from a standard normal distribution.
+            dim: dimensionality of w.
+                If None and w is not provided, draw w samples of size model.num_outputs.
+            jitter: jitter value to be added for numerical stability, 1e-8 by default.
+            dtype: dtype for w if specified
+            device: device for w if specified
+        """
+        super().__init__()
+        self.model = model
+        self._num_outputs = model.num_outputs
+        self.jitter = jitter
+        if w is None:
+            self.w = (
+                torch.randn(model.num_outputs, dtype=dtype, device=device)
+                if dim is None
+                else torch.randn(dim, dtype=dtype, device=device)
+            )
+        else:
+            self.w = w
+
+    def forward(self, X: Tensor) -> Tensor:
+        post = self.model.posterior(X)
+        return post.mean + torch.sqrt(post.variance + self.jitter) * self.w.to(X)

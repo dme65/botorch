@@ -28,8 +28,29 @@ from the repository root. No additional configuration should be needed (see the
 [black documentation](https://black.readthedocs.io/en/stable/installation_and_usage.html#usage)
 for advanced usage).
 
-We feel strongly that having a consistent code style is extremely important, so
-Travis will fail on your PR if it does not adhere to the black formatting style.
+Docstring formatting: We recommend [Google-style](https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html) docstrings.
+To make sure documentation is rendered correctly, we require that every `__init__`
+function contains an "Args" block.
+We use `flake8-docstrings` to check this, as well as `flake8` to check code style. To use these tools, run
+`pip install flake8` and `pip install flake8-docstrings`, and then run
+```bash
+flake8 .
+```
+
+
+#### Import Sorting
+
+BoTorch uses [ufmt]https://github.com/omnilib/ufmt library for consistent
+sorting of imports across the codebase. Install via `pip install ufmt`, and
+auto-sort with
+```bash
+ufmt format .
+```
+from the repository root.
+
+We feel strongly that having a consistent code style and imports is important,
+so CI will fail on your PR if it does not pass ufmt muster (note: under the
+hood ufmt also checks black code style).
 
 
 #### Type Hints
@@ -85,7 +106,7 @@ The following command will both build the docs and serve the site locally:
 ## Pull Requests
 We actively welcome your pull requests.
 
-1. Fork the repo and create your branch from `master`.
+1. Fork the repo and create your branch from `main`.
 2. If you have added code that should be tested, add unit tests.
    In other words, add unit tests.
 3. If you have changed APIs, update the documentation. Make sure the

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -8,11 +8,19 @@ import warnings
 from typing import Any
 
 import torch
+from botorch.models import (
+    GenericDeterministicModel,
+    ModelList,
+    ModelListGP,
+    SaasFullyBayesianSingleTaskGP,
+    SingleTaskGP,
+)
 from botorch.models.model import Model
 from botorch.utils.testing import BotorchTestCase, MockModel, MockPosterior
 from botorch.utils.transforms import (
     _verify_output_shape,
     concatenate_pending_points,
+    is_fully_bayesian,
     match_batch_shape,
     normalize,
     normalize_indices,
@@ -110,6 +118,13 @@ class NotSoAbstractBaseModel(Model):
     def posterior(self, X, output_indices, observation_noise, **kwargs):
         pass
 
+    @property
+    def batch_shape(self) -> torch.Size():
+        if hasattr(self, "_batch_shape"):
+            return self._batch_shape
+        else:
+            return super().batch_shape
+
 
 class TestBatchModeTransform(BotorchTestCase):
     def test_verify_output_shape(self):
@@ -121,13 +136,25 @@ class TestBatchModeTransform(BotorchTestCase):
         X = torch.ones(1, 1, 1)
         self.assertTrue(_verify_output_shape(acqf=None, X=X, output=torch.tensor(1)))
         # shape mismatch and cls does not have model attribute
-        cls = BMIMTestClass()
+        acqf = BMIMTestClass()
         with self.assertWarns(RuntimeWarning):
-            self.assertTrue(_verify_output_shape(acqf=cls, X=X, output=X))
+            self.assertTrue(_verify_output_shape(acqf=acqf, X=X, output=X))
         # shape mismatch and cls.model does not define batch shape
-        cls.model = NotSoAbstractBaseModel()
+        acqf.model = NotSoAbstractBaseModel()
         with self.assertWarns(RuntimeWarning):
-            self.assertTrue(_verify_output_shape(acqf=cls, X=X, output=X))
+            self.assertTrue(_verify_output_shape(acqf=acqf, X=X, output=X))
+        # Output matches model batch shape.
+        acqf.model._batch_shape = torch.Size([3, 5])
+        self.assertTrue(_verify_output_shape(acqf=acqf, X=X, output=torch.empty(3, 5)))
+        # Output has additional dimensions beyond model batch shape.
+        for X_batch in [(2, 3, 5), (2, 1, 5), (2, 1, 1)]:
+            self.assertTrue(
+                _verify_output_shape(
+                    acqf=acqf,
+                    X=torch.empty(*X_batch, 1, 1),
+                    output=torch.empty(2, 3, 5),
+                )
+            )
 
     def test_t_batch_mode_transform(self):
         c = BMIMTestClass()
@@ -190,6 +217,11 @@ class TestBatchModeTransform(BotorchTestCase):
         c.model = MockModel(MockPosterior(mean=X.repeat(2, *[1] * X.dim())))
         Xout = c.broadcast_batch_shape_method(X)
         self.assertEqual(Xout.shape, c.model.batch_shape)
+
+        # test with non-tensor argument
+        X = ((3, 4), {"foo": True})
+        Xout = c.q_method(X)
+        self.assertEqual(X, Xout)
 
 
 class TestConcatenatePendingPoints(BotorchTestCase):
@@ -273,3 +305,23 @@ class TestSqueezeLastDim(BotorchTestCase):
             Y_squeezed = squeeze_last_dim(Y=Y)
             self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in ws))
         self.assertTrue(torch.equal(Y_squeezed, Y.squeeze(-1)))
+
+
+class TestIsFullyBayesian(BotorchTestCase):
+    def test_is_fully_bayesian(self):
+        X, Y = torch.rand(3, 2), torch.randn(3, 1)
+        saas = SaasFullyBayesianSingleTaskGP(train_X=X, train_Y=Y)
+        vanilla_gp = SingleTaskGP(train_X=X, train_Y=Y)
+        deterministic = GenericDeterministicModel(f=lambda x: x)
+        # Single model
+        self.assertTrue(is_fully_bayesian(model=saas))
+        self.assertFalse(is_fully_bayesian(model=vanilla_gp))
+        self.assertFalse(is_fully_bayesian(model=deterministic))
+        # ModelListGP
+        self.assertTrue(is_fully_bayesian(model=ModelListGP(saas, saas)))
+        self.assertTrue(is_fully_bayesian(model=ModelListGP(saas, vanilla_gp)))
+        self.assertFalse(is_fully_bayesian(model=ModelListGP(vanilla_gp, vanilla_gp)))
+        # ModelList
+        self.assertTrue(is_fully_bayesian(model=ModelList(saas, saas)))
+        self.assertTrue(is_fully_bayesian(model=ModelList(saas, deterministic)))
+        self.assertFalse(is_fully_bayesian(model=ModelList(vanilla_gp, deterministic)))

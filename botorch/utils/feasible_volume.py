@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -85,12 +85,14 @@ def get_outcome_feasibility_probability(
     if outcome_constraints is None:
         return 1.0
 
-    from botorch.sampling import SobolQMCNormalSampler
+    from botorch.sampling.get_sampler import get_sampler
 
     seed = seed if seed is not None else torch.randint(0, 1000000, (1,)).item()
 
     posterior = model.posterior(X)  # posterior consists of batch_shape marginals
-    sampler = SobolQMCNormalSampler(num_samples=nsample_outcome, seed=seed)
+    sampler = get_sampler(
+        posterior=posterior, sample_shape=torch.Size([nsample_outcome]), seed=seed
+    )
     # size of samples: (num outcome samples, batch_shape, 1, outcome dim)
     samples = sampler(posterior)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -9,14 +9,22 @@ from botorch.acquisition.analytic import ExpectedImprovement
 from botorch.acquisition.monte_carlo import qExpectedImprovement
 from botorch.acquisition.penalized import (
     GaussianPenalty,
+    group_lasso_regularizer,
     GroupLassoPenalty,
+    L1Penalty,
+    L1PenaltyObjective,
     L2Penalty,
     PenalizedAcquisitionFunction,
-    group_lasso_regularizer,
+    PenalizedMCObjective,
 )
 from botorch.exceptions import UnsupportedError
-from botorch.sampling.samplers import IIDNormalSampler
+from botorch.sampling.normal import IIDNormalSampler
 from botorch.utils.testing import BotorchTestCase, MockModel, MockPosterior
+from torch import Tensor
+
+
+def generic_obj(samples: Tensor, X=None) -> Tensor:
+    return torch.log(torch.sum(samples**2, dim=-1))
 
 
 class TestL2Penalty(BotorchTestCase):
@@ -37,6 +45,23 @@ class TestL2Penalty(BotorchTestCase):
             self.assertEqual(computed_value.item(), real_value.item())
 
 
+class TestL1Penalty(BotorchTestCase):
+    def test_l1_penalty(self):
+        for dtype in (torch.float, torch.double):
+            init_point = torch.tensor([1.0, 1.0, 1.0], device=self.device, dtype=dtype)
+            l1_module = L1Penalty(init_point=init_point)
+
+            # testing a batch of two points
+            sample_point = torch.tensor(
+                [[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]], device=self.device, dtype=dtype
+            )
+
+            diff_l1_norm = torch.norm((sample_point - init_point), p=1, dim=-1)
+            real_value = diff_l1_norm.max(dim=-1).values
+            computed_value = l1_module(sample_point)
+            self.assertEqual(computed_value.item(), real_value.item())
+
+
 class TestGaussianPenalty(BotorchTestCase):
     def test_gaussian_penalty(self):
         for dtype in (torch.float, torch.double):
@@ -52,7 +77,7 @@ class TestGaussianPenalty(BotorchTestCase):
                 torch.norm((sample_point - init_point), p=2, dim=-1) ** 2
             )
             max_l2_distance = diff_norm_squared.max(dim=-1).values
-            real_value = torch.exp(max_l2_distance / 2 / sigma ** 2)
+            real_value = torch.exp(max_l2_distance / 2 / sigma**2)
             computed_value = gaussian_module(sample_point)
             self.assertEqual(computed_value.item(), real_value.item())
 
@@ -85,8 +110,8 @@ class TestPenalizedAcquisitionFunction(BotorchTestCase):
             tkwargs = {"device": self.device, "dtype": dtype}
             mock_model = MockModel(
                 MockPosterior(
-                    mean=torch.tensor([1.0], **tkwargs),
-                    variance=torch.tensor([1.0], **tkwargs),
+                    mean=torch.tensor([[1.0]], **tkwargs),
+                    variance=torch.tensor([[1.0]], **tkwargs),
                 )
             )
             init_point = torch.tensor([0.5, 0.5, 0.5], **tkwargs)
@@ -111,7 +136,7 @@ class TestPenalizedAcquisitionFunction(BotorchTestCase):
                 acqf.set_X_pending(X_pending)
 
             # testing X_pending for non-analytic raw_acqfn (EI)
-            sampler = IIDNormalSampler(num_samples=2)
+            sampler = IIDNormalSampler(sample_shape=torch.Size([2]))
             raw_acqf_2 = qExpectedImprovement(
                 model=mock_model, best_f=0, sampler=sampler
             )
@@ -126,3 +151,50 @@ class TestPenalizedAcquisitionFunction(BotorchTestCase):
             X_pending = torch.tensor([0.1, 0.2, 0.3], **tkwargs)
             acqf_2.set_X_pending(X_pending)
             self.assertTrue(torch.equal(acqf_2.X_pending, X_pending))
+
+
+class TestL1PenaltyObjective(BotorchTestCase):
+    def test_l1_penalty(self):
+        for dtype in (torch.float, torch.double):
+            init_point = torch.tensor([1.0, 1.0, 1.0], device=self.device, dtype=dtype)
+            l1_module = L1PenaltyObjective(init_point=init_point)
+
+            # testing a batch of two points
+            sample_point = torch.tensor(
+                [[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]], device=self.device, dtype=dtype
+            )
+
+            real_values = torch.norm(
+                (sample_point - init_point), p=1, dim=-1
+            ).unsqueeze(dim=0)
+            computed_values = l1_module(sample_point)
+            self.assertTrue(torch.equal(real_values, computed_values))
+
+
+class TestPenalizedMCObjective(BotorchTestCase):
+    def test_penalized_mc_objective(self):
+        for dtype in (torch.float, torch.double):
+            init_point = torch.tensor(
+                [0.0, 0.0, 0.0, 0.0, 0.0], device=self.device, dtype=dtype
+            )
+            l1_penalty_obj = L1PenaltyObjective(init_point=init_point)
+            obj = PenalizedMCObjective(
+                objective=generic_obj,
+                penalty_objective=l1_penalty_obj,
+                regularization_parameter=0.1,
+            )
+            # test 'd' Tensor X
+            samples = torch.randn(4, 3, device=self.device, dtype=dtype)
+            X = torch.randn(4, 5, device=self.device, dtype=dtype)
+            penalized_obj = generic_obj(samples) - 0.1 * l1_penalty_obj(X)
+            self.assertTrue(torch.equal(obj(samples, X), penalized_obj))
+            # test 'q x d' Tensor X
+            samples = torch.randn(4, 2, 3, device=self.device, dtype=dtype)
+            X = torch.randn(2, 5, device=self.device, dtype=dtype)
+            penalized_obj = generic_obj(samples) - 0.1 * l1_penalty_obj(X)
+            self.assertTrue(torch.equal(obj(samples, X), penalized_obj))
+            # test 'batch-shape x q x d' Tensor X
+            samples = torch.randn(4, 3, 2, 3, device=self.device, dtype=dtype)
+            X = torch.randn(3, 2, 5, device=self.device, dtype=dtype)
+            penalized_obj = generic_obj(samples) - 0.1 * l1_penalty_obj(X)
+            self.assertTrue(torch.equal(obj(samples, X), penalized_obj))

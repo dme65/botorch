@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -11,18 +11,33 @@ from botorch.test_functions.multi_fidelity import (
 )
 from botorch.test_functions.multi_objective import (
     BNH,
+    BraninCurrin,
     C2DTLZ2,
+    CarSideImpact,
     CONSTR,
+    ConstrainedBraninCurrin,
+    DiscBrake,
     DTLZ1,
     DTLZ2,
+    DTLZ3,
+    DTLZ4,
+    DTLZ5,
+    DTLZ7,
+    GMM,
+    MW7,
     OSY,
+    Penicillin,
     SRN,
+    ToyRobust,
+    VehicleSafety,
+    WeldedBeam,
     ZDT1,
     ZDT2,
     ZDT3,
-    BraninCurrin,
-    ConstrainedBraninCurrin,
-    VehicleSafety,
+)
+from botorch.test_functions.multi_objective_multi_fidelity import (
+    MOMFBraninCurrin,
+    MOMFPark,
 )
 from botorch.test_functions.synthetic import (
     Ackley,
@@ -61,19 +76,28 @@ __all__ = [
     "Bukin",
     "CONSTR",
     "Cosine8",
+    "CarSideImpact",
     "ConstrainedBraninCurrin",
     "C2DTLZ2",
+    "DiscBrake",
     "DixonPrice",
     "DropWave",
     "DTLZ1",
     "DTLZ2",
+    "DTLZ3",
+    "DTLZ4",
+    "DTLZ5",
+    "DTLZ7",
     "EggHolder",
+    "GMM",
     "Griewank",
     "Hartmann",
     "HolderTable",
     "Levy",
     "Michalewicz",
+    "MW7",
     "OSY",
+    "Penicillin",
     "Powell",
     "Rastrigin",
     "Rosenbrock",
@@ -83,8 +107,12 @@ __all__ = [
     "StyblinskiTang",
     "SyntheticTestFunction",
     "ThreeHumpCamel",
+    "ToyRobust",
     "VehicleSafety",
+    "WeldedBeam",
     "ZDT1",
     "ZDT2",
     "ZDT3",
+    "MOMFBraninCurrin",
+    "MOMFPark",
 ]

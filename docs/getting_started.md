@@ -13,19 +13,14 @@ Before jumping the gun, we recommend you start with the high-level
 
 #### Installation Requirements:
 
-- Python >= 3.7
-- PyTorch >= 1.7.1
-- gpytorch >= 1.4
-- scipy
-
 BoTorch is easily installed via
-[Anaconda](https://www.anaconda.com/distribution/#download-section) (recommended)
+[Anaconda](https://www.anaconda.com/distribution/#download-section) (strongly recommended for OSX)
 or `pip`:
 
 <!--DOCUSAURUS_CODE_TABS-->
-<!--conda-->
+<!--Conda-->
 ```bash
-conda install botorch -c pytorch -c gpytorch
+conda install botorch -c pytorch -c gpytorch -c conda-forge
 ```
 <!--pip-->
 ```bash
@@ -33,8 +28,8 @@ pip install botorch
 ```
 <!--END_DOCUSAURUS_CODE_TABS-->
 
-For more detailed installation instructions, please see the
-[Project Readme](https://github.com/pytorch/botorch/blob/master/README.md)
+For more installation options and detailed instructions, please see the
+[Project Readme](https://github.com/pytorch/botorch/blob/main/README.md)
 on GitHub.
 
 ## Basic Components
@@ -45,7 +40,7 @@ Here's a quick run down of the main components of a Bayesian Optimization loop.
     ```python
     import torch
     from botorch.models import SingleTaskGP
-    from botorch.fit import fit_gpytorch_model
+    from botorch.fit import fit_gpytorch_mll
     from gpytorch.mlls import ExactMarginalLogLikelihood
 
     train_X = torch.rand(10, 2)
@@ -55,7 +50,7 @@ Here's a quick run down of the main components of a Bayesian Optimization loop.
 
     gp = SingleTaskGP(train_X, train_Y)
     mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
-    fit_gpytorch_model(mll);
+    fit_gpytorch_mll(mll);
     ```
 
 2. Construct an acquisition function
@@ -91,5 +86,5 @@ For an in-depth reference of the various BoTorch internals, see our
 ## Contributing
 
 You'd like to contribute to BoTorch? Great! Please see
-[here](https://github.com/pytorch/botorch/blob/master/CONTRIBUTING.md)
+[here](https://github.com/pytorch/botorch/blob/main/CONTRIBUTING.md)
 for how to help out.

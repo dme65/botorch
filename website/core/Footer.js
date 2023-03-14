@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -99,16 +99,16 @@ class Footer extends React.Component {
           className="fbOpenSource">
           <img
             src={`${this.props.config.baseUrl}img/oss_logo.png`}
-            alt="Facebook Open Source"
-            width="170"
-            height="45"
+            alt="Meta Open Source"
+            width="300"
+            height="25"
           />
         </a>
         <section className="copyright">
           {this.props.config.copyright && (
             <span>{this.props.config.copyright}</span>
           )}{' '}
-          Copyright &copy; {currentYear} Facebook Inc.
+          Copyright &copy; {currentYear} Meta Platforms, Inc
         </section>
         {process.env.NODE_ENV !== 'development' &&
           <script dangerouslySetInnerHTML={{__html:`

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -13,19 +13,28 @@ from botorch.acquisition.cost_aware import GenericCostAwareUtility
 from botorch.acquisition.knowledge_gradient import (
     _get_value_function,
     _split_fantasy_points,
+    ProjectedAcquisitionFunction,
     qKnowledgeGradient,
     qMultiFidelityKnowledgeGradient,
-    ProjectedAcquisitionFunction,
 )
 from botorch.acquisition.monte_carlo import qExpectedImprovement, qSimpleRegret
-from botorch.acquisition.objective import GenericMCObjective, ScalarizedObjective
+from botorch.acquisition.objective import (
+    GenericMCObjective,
+    ScalarizedObjective,
+    ScalarizedPosteriorTransform,
+)
 from botorch.acquisition.utils import project_to_sample_points
 from botorch.exceptions.errors import UnsupportedError
+from botorch.generation.gen import gen_candidates_scipy
 from botorch.models import SingleTaskGP
+from botorch.optim.optimize import optimize_acqf
+from botorch.optim.utils import _filter_kwargs
 from botorch.posteriors.gpytorch import GPyTorchPosterior
-from botorch.sampling.samplers import IIDNormalSampler, SobolQMCNormalSampler
+from botorch.sampling.normal import IIDNormalSampler, SobolQMCNormalSampler
 from botorch.utils.testing import BotorchTestCase, MockModel, MockPosterior
 from gpytorch.distributions import MultitaskMultivariateNormal
+
+from .test_monte_carlo import DummyNonScalarizingPosteriorTransform
 
 NO = "botorch.utils.testing.MockModel.num_outputs"
 
@@ -43,7 +52,7 @@ class TestQKnowledgeGradient(BotorchTestCase):
             with self.assertRaises(ValueError):
                 qKnowledgeGradient(model=mm, num_fantasies=None)
             # test error when sampler and num_fantasies arg are inconsistent
-            sampler = IIDNormalSampler(num_samples=16)
+            sampler = IIDNormalSampler(sample_shape=torch.Size([16]))
             with self.assertRaises(ValueError):
                 qKnowledgeGradient(model=mm, num_fantasies=32, sampler=sampler)
             # test default construction
@@ -58,7 +67,7 @@ class TestQKnowledgeGradient(BotorchTestCase):
             self.assertEqual(qKG.get_augmented_q_batch_size(q=3), 32 + 3)
             # test custom construction
             obj = GenericMCObjective(lambda Y, X: Y.mean(dim=-1))
-            sampler = IIDNormalSampler(num_samples=16)
+            sampler = IIDNormalSampler(sample_shape=torch.Size([16]))
             X_pending = torch.zeros(2, 2, device=self.device, dtype=dtype)
             qKG = qKnowledgeGradient(
                 model=mm,
@@ -80,7 +89,7 @@ class TestQKnowledgeGradient(BotorchTestCase):
             qKG = qKnowledgeGradient(model=mm, num_fantasies=None, sampler=sampler)
             self.assertEqual(qKG.sampler.sample_shape, torch.Size([16]))
             # test custom construction with inner sampler and current value
-            inner_sampler = SobolQMCNormalSampler(num_samples=256)
+            inner_sampler = SobolQMCNormalSampler(sample_shape=torch.Size([256]))
             current_value = torch.zeros(1, device=self.device, dtype=dtype)
             qKG = qKnowledgeGradient(
                 model=mm,
@@ -97,22 +106,48 @@ class TestQKnowledgeGradient(BotorchTestCase):
             self.assertIsNone(qKG.X_pending)
             self.assertTrue(torch.equal(qKG.current_value, current_value))
             self.assertEqual(qKG.get_augmented_q_batch_size(q=3), 8 + 3)
-            # test construction with non-MC objective (ScalarizedObjective)
+            # test construction with posterior_transform
             qKG_s = qKnowledgeGradient(
                 model=mm,
                 num_fantasies=16,
                 sampler=sampler,
-                objective=ScalarizedObjective(weights=torch.rand(2)),
+                posterior_transform=ScalarizedPosteriorTransform(weights=torch.rand(2)),
             )
             self.assertIsNone(qKG_s.inner_sampler)
-            self.assertIsInstance(qKG_s.objective, ScalarizedObjective)
-            # test error if no objective and multi-output model
+            self.assertIsInstance(
+                qKG_s.posterior_transform, ScalarizedPosteriorTransform
+            )
+            # test error if multi-output model and no objective or posterior transform
             mean2 = torch.zeros(1, 2, device=self.device, dtype=dtype)
             mm2 = MockModel(MockPosterior(mean=mean2))
             with self.assertRaises(UnsupportedError):
                 qKnowledgeGradient(model=mm2)
+            # test error if multi-output model and no objective and posterior transform
+            # does not scalarize
+            with self.assertRaises(UnsupportedError):
+                qKnowledgeGradient(
+                    model=mm2,
+                    posterior_transform=DummyNonScalarizingPosteriorTransform(),
+                )
+            # test handling of scalarized objective
+            obj = ScalarizedObjective(weights=torch.rand(2))
+            post_tf = ScalarizedPosteriorTransform(weights=torch.rand(2))
+            with self.assertRaises(RuntimeError):
+                qKnowledgeGradient(
+                    model=mm2, objective=obj, posterior_transform=post_tf
+                )
+            acqf = qKnowledgeGradient(model=mm2, objective=obj)
+            self.assertIsInstance(
+                acqf.posterior_transform, ScalarizedPosteriorTransform
+            )
+            self.assertIsNone(acqf.objective)
 
     def test_evaluate_q_knowledge_gradient(self):
+        # Stop gap measure to avoid test failures on Ampere devices
+        # TODO: Find an elegant way of disallowing tf32 for botorch/gpytorch
+        # without blanket-disallowing it for all of torch.
+        torch.backends.cuda.matmul.allow_tf32 = False
+
         for dtype in (torch.float, torch.double):
             # basic test
             n_f = 4
@@ -129,7 +164,7 @@ class TestQKnowledgeGradient(BotorchTestCase):
                     patch_f.assert_called_once()
                     cargs, ckwargs = patch_f.call_args
                     self.assertEqual(ckwargs["X"].shape, torch.Size([1, 1, 1]))
-            self.assertTrue(torch.allclose(val, mean.mean(), atol=1e-4))
+            self.assertAllClose(val, mean.mean(), atol=1e-4)
             self.assertTrue(torch.equal(qKG.extract_candidates(X), X[..., :-n_f, :]))
             # batched evaluation
             b = 2
@@ -171,7 +206,9 @@ class TestQKnowledgeGradient(BotorchTestCase):
                     patch_f.assert_called_once()
                     cargs, ckwargs = patch_f.call_args
                     self.assertEqual(ckwargs["X"].shape, torch.Size([1, 3, 1]))
-            self.assertTrue(torch.allclose(val, mean.mean() - current_value, atol=1e-4))
+
+            expected = (mean.mean() - current_value).reshape([])
+            self.assertAllClose(val, expected, atol=1e-4)
             self.assertTrue(torch.equal(qKG.extract_candidates(X), X[..., :-n_f, :]))
             # test objective (inner MC sampling)
             objective = GenericMCObjective(objective=lambda Y, X: Y.norm(dim=-1))
@@ -189,11 +226,11 @@ class TestQKnowledgeGradient(BotorchTestCase):
                     patch_f.assert_called_once()
                     cargs, ckwargs = patch_f.call_args
                     self.assertEqual(ckwargs["X"].shape, torch.Size([1, 1, 1]))
-            self.assertTrue(torch.allclose(val, objective(samples).mean(), atol=1e-4))
+            self.assertAllClose(val, objective(samples).mean(), atol=1e-4)
             self.assertTrue(torch.equal(qKG.extract_candidates(X), X[..., :-n_f, :]))
-            # test non-MC objective (ScalarizedObjective)
+            # test scalarized posterior transform
             weights = torch.rand(2, device=self.device, dtype=dtype)
-            objective = ScalarizedObjective(weights=weights)
+            post_tf = ScalarizedPosteriorTransform(weights=weights)
             mean = torch.tensor([1.0, 0.5], device=self.device, dtype=dtype).expand(
                 n_f, 1, 2
             )
@@ -207,14 +244,14 @@ class TestQKnowledgeGradient(BotorchTestCase):
                     mock_num_outputs.return_value = 2
                     mm = MockModel(None)
                     qKG = qKnowledgeGradient(
-                        model=mm, num_fantasies=n_f, objective=objective
+                        model=mm, num_fantasies=n_f, posterior_transform=post_tf
                     )
                     val = qKG(X)
                     patch_f.assert_called_once()
                     cargs, ckwargs = patch_f.call_args
                     self.assertEqual(ckwargs["X"].shape, torch.Size([1, 1, 1]))
-                    val_expected = (mean * weights).sum(-1).mean(0)
-                    self.assertTrue(torch.allclose(val, val_expected))
+                    val_expected = (mean * weights).sum(-1).mean(0)[0]
+                    self.assertAllClose(val, val_expected)
 
     def test_evaluate_kg(self):
         # a thorough test using real model and dtype double
@@ -304,12 +341,13 @@ class TestQMultiFidelityKnowledgeGradient(BotorchTestCase):
 
     def test_evaluate_qMFKG(self):
         for dtype in (torch.float, torch.double):
+            tkwargs = {"device": self.device, "dtype": dtype}
             # basic test
             n_f = 4
-            current_value = torch.rand(1, device=self.device, dtype=dtype)
+            current_value = torch.rand(1, **tkwargs)
             cau = GenericCostAwareUtility(mock_util)
-            mean = torch.rand(n_f, 1, 1, device=self.device, dtype=dtype)
-            variance = torch.rand(n_f, 1, 1, device=self.device, dtype=dtype)
+            mean = torch.rand(n_f, 1, 1, **tkwargs)
+            variance = torch.rand(n_f, 1, 1, **tkwargs)
             mfm = MockModel(MockPosterior(mean=mean, variance=variance))
             with mock.patch.object(MockModel, "fantasize", return_value=mfm) as patch_f:
                 with mock.patch(NO, new_callable=mock.PropertyMock) as mock_num_outputs:
@@ -321,22 +359,22 @@ class TestQMultiFidelityKnowledgeGradient(BotorchTestCase):
                         current_value=current_value,
                         cost_aware_utility=cau,
                     )
-                    X = torch.rand(n_f + 1, 1, device=self.device, dtype=dtype)
+                    X = torch.rand(n_f + 1, 1, **tkwargs)
                     val = qMFKG(X)
                     patch_f.assert_called_once()
                     cargs, ckwargs = patch_f.call_args
                     self.assertEqual(ckwargs["X"].shape, torch.Size([1, 1, 1]))
             val_exp = mock_util(X, mean.squeeze(-1) - current_value).mean(dim=0)
-            self.assertTrue(torch.allclose(val, val_exp, atol=1e-4))
+            self.assertAllClose(val, val_exp, atol=1e-4)
             self.assertTrue(torch.equal(qMFKG.extract_candidates(X), X[..., :-n_f, :]))
             # batched evaluation
             b = 2
-            current_value = torch.rand(b, device=self.device, dtype=dtype)
+            current_value = torch.rand(b, **tkwargs)
             cau = GenericCostAwareUtility(mock_util)
-            mean = torch.rand(n_f, b, 1, device=self.device, dtype=dtype)
-            variance = torch.rand(n_f, b, 1, device=self.device, dtype=dtype)
+            mean = torch.rand(n_f, b, 1, **tkwargs)
+            variance = torch.rand(n_f, b, 1, **tkwargs)
             mfm = MockModel(MockPosterior(mean=mean, variance=variance))
-            X = torch.rand(b, n_f + 1, 1, device=self.device, dtype=dtype)
+            X = torch.rand(b, n_f + 1, 1, **tkwargs)
             with mock.patch.object(MockModel, "fantasize", return_value=mfm) as patch_f:
                 with mock.patch(NO, new_callable=mock.PropertyMock) as mock_num_outputs:
                     mock_num_outputs.return_value = 1
@@ -352,15 +390,15 @@ class TestQMultiFidelityKnowledgeGradient(BotorchTestCase):
                     cargs, ckwargs = patch_f.call_args
                     self.assertEqual(ckwargs["X"].shape, torch.Size([b, 1, 1]))
             val_exp = mock_util(X, mean.squeeze(-1) - current_value).mean(dim=0)
-            self.assertTrue(torch.allclose(val, val_exp, atol=1e-4))
+            self.assertAllClose(val, val_exp, atol=1e-4)
             self.assertTrue(torch.equal(qMFKG.extract_candidates(X), X[..., :-n_f, :]))
             # pending points and current value
-            mean = torch.rand(n_f, 1, 1, device=self.device, dtype=dtype)
-            variance = torch.rand(n_f, 1, 1, device=self.device, dtype=dtype)
-            X_pending = torch.rand(2, 1, device=self.device, dtype=dtype)
+            mean = torch.rand(n_f, 1, 1, **tkwargs)
+            variance = torch.rand(n_f, 1, 1, **tkwargs)
+            X_pending = torch.rand(2, 1, **tkwargs)
             mfm = MockModel(MockPosterior(mean=mean, variance=variance))
-            current_value = torch.rand(1, device=self.device, dtype=dtype)
-            X = torch.rand(n_f + 1, 1, device=self.device, dtype=dtype)
+            current_value = torch.rand(1, **tkwargs)
+            X = torch.rand(n_f + 1, 1, **tkwargs)
             with mock.patch.object(MockModel, "fantasize", return_value=mfm) as patch_f:
                 with mock.patch(NO, new_callable=mock.PropertyMock) as mock_num_outputs:
                     mock_num_outputs.return_value = 1
@@ -377,13 +415,13 @@ class TestQMultiFidelityKnowledgeGradient(BotorchTestCase):
                     cargs, ckwargs = patch_f.call_args
                     self.assertEqual(ckwargs["X"].shape, torch.Size([1, 3, 1]))
             val_exp = mock_util(X, mean.squeeze(-1) - current_value).mean(dim=0)
-            self.assertTrue(torch.allclose(val, val_exp, atol=1e-4))
+            self.assertAllClose(val, val_exp, atol=1e-4)
             self.assertTrue(torch.equal(qMFKG.extract_candidates(X), X[..., :-n_f, :]))
             # test objective (inner MC sampling)
             objective = GenericMCObjective(objective=lambda Y, X: Y.norm(dim=-1))
-            samples = torch.randn(3, 1, 1, device=self.device, dtype=dtype)
+            samples = torch.randn(3, 1, 1, **tkwargs)
             mfm = MockModel(MockPosterior(samples=samples))
-            X = torch.rand(n_f + 1, 1, device=self.device, dtype=dtype)
+            X = torch.rand(n_f + 1, 1, **tkwargs)
             with mock.patch.object(MockModel, "fantasize", return_value=mfm) as patch_f:
                 with mock.patch(NO, new_callable=mock.PropertyMock) as mock_num_outputs:
                     mock_num_outputs.return_value = 1
@@ -400,18 +438,18 @@ class TestQMultiFidelityKnowledgeGradient(BotorchTestCase):
                     cargs, ckwargs = patch_f.call_args
                     self.assertEqual(ckwargs["X"].shape, torch.Size([1, 1, 1]))
             val_exp = mock_util(X, objective(samples) - current_value).mean(dim=0)
-            self.assertTrue(torch.allclose(val, val_exp, atol=1e-4))
+            self.assertAllClose(val, val_exp, atol=1e-4)
             self.assertTrue(torch.equal(qMFKG.extract_candidates(X), X[..., :-n_f, :]))
             # test valfunc_cls and valfunc_argfac
             d, p, d_prime = 4, 3, 2
-            samples = torch.ones(3, 1, 1, device=self.device, dtype=dtype)
-            mean = torch.tensor(
-                [[0.25], [0.5], [0.75]], device=self.device, dtype=dtype
-            ).expand(n_f, 1, -1, -1)
-            weights = torch.tensor([0.5, 1.0, 1.0], device=self.device, dtype=dtype)
+            samples = torch.ones(3, 1, 1, **tkwargs)
+            mean = torch.tensor([[0.25], [0.5], [0.75]], **tkwargs).expand(
+                n_f, 1, -1, -1
+            )
+            weights = torch.tensor([0.5, 1.0, 1.0], **tkwargs)
             mfm = MockModel(MockPosterior(mean=mean, samples=samples))
-            X = torch.rand(n_f * d + d, d, device=self.device, dtype=dtype)
-            sample_points = torch.rand(p, d_prime, device=self.device, dtype=dtype)
+            X = torch.rand(n_f * d + d, d, **tkwargs)
+            sample_points = torch.rand(p, d_prime, **tkwargs)
             with mock.patch.object(MockModel, "fantasize", return_value=mfm) as patch_f:
                 with mock.patch(NO, new_callable=mock.PropertyMock) as mock_num_outputs:
                     mock_num_outputs.return_value = 1
@@ -427,10 +465,12 @@ class TestQMultiFidelityKnowledgeGradient(BotorchTestCase):
                     patch_f.assert_called_once()
                     cargs, ckwargs = patch_f.call_args
                     self.assertEqual(ckwargs["X"].shape, torch.Size([1, 16, 4]))
-                    val_exp = torch.tensor([1.375], device=self.device, dtype=dtype)
-                    self.assertTrue(torch.allclose(val, val_exp, atol=1e-4))
+                    val_exp = torch.tensor([1.375], **tkwargs)
+                    self.assertAllClose(val, val_exp, atol=1e-4)
 
                     patch_f.reset_mock()
+                    # Make posterior sample shape agree with X
+                    mfm._posterior._samples = torch.ones(1, 3, 1, **tkwargs)
                     qMFKG = qMultiFidelityKnowledgeGradient(
                         model=mm,
                         num_fantasies=n_f,
@@ -442,8 +482,8 @@ class TestQMultiFidelityKnowledgeGradient(BotorchTestCase):
                     patch_f.assert_called_once()
                     cargs, ckwargs = patch_f.call_args
                     self.assertEqual(ckwargs["X"].shape, torch.Size([1, 16, 4]))
-                    val_exp = torch.tensor([1.0], device=self.device, dtype=dtype)
-                    self.assertTrue(torch.allclose(val, val_exp, atol=1e-4))
+                    val_exp = torch.tensor(1.0, device=self.device, dtype=dtype)
+                    self.assertAllClose(val, val_exp, atol=1e-4)
 
     def test_fixed_evaluation_qMFKG(self):
         # mock test qMFKG.evaluate() with expand, project & cost aware utility
@@ -507,9 +547,70 @@ class TestQMultiFidelityKnowledgeGradient(BotorchTestCase):
                         torch.ones(1, 2, 1, device=self.device, dtype=dtype),
                     )
                 )
-            self.assertEqual(
-                val, cau(None, torch.ones(1, device=self.device, dtype=dtype))
-            )
+                self.assertEqual(
+                    val, cau(None, torch.ones(1, device=self.device, dtype=dtype))
+                )
+                # test with defaults - should see no errors
+                qMFKG = qMultiFidelityKnowledgeGradient(
+                    model=mm,
+                    num_fantasies=n_f,
+                )
+                qMFKG.evaluate(
+                    X=torch.zeros(1, 1, 1, device=self.device, dtype=dtype),
+                    bounds=torch.tensor(
+                        [[0.0], [1.0]], device=self.device, dtype=dtype
+                    ),
+                    num_restarts=1,
+                    raw_samples=1,
+                )
+
+    def test_optimize_w_posterior_transform(self):
+        # This is mainly testing that we can optimize without errors.
+        for dtype in (torch.float, torch.double):
+            tkwargs = {"dtype": dtype, "device": self.device}
+            mean = torch.tensor([1.0, 0.5], **tkwargs).expand(2, 1, 2)
+            cov = torch.tensor([[1.0, 0.1], [0.1, 0.5]], **tkwargs).expand(2, 2, 2)
+            posterior = GPyTorchPosterior(MultitaskMultivariateNormal(mean, cov))
+            model = MockModel(posterior)
+            n_f = 4
+            mean = torch.tensor([1.0, 0.5], **tkwargs).expand(n_f, 2, 1, 2)
+            cov = torch.tensor([[1.0, 0.1], [0.1, 0.5]], **tkwargs).expand(n_f, 2, 2, 2)
+            posterior = GPyTorchPosterior(MultitaskMultivariateNormal(mean, cov))
+            mfm = MockModel(posterior)
+            bounds = torch.zeros(2, 2, **tkwargs)
+            bounds[1] = 1
+            options = {"num_inner_restarts": 2, "raw_inner_samples": 2}
+            with mock.patch.object(MockModel, "fantasize", return_value=mfm):
+                kg = qMultiFidelityKnowledgeGradient(
+                    model=model,
+                    num_fantasies=n_f,
+                    posterior_transform=ScalarizedPosteriorTransform(
+                        weights=torch.rand(2, **tkwargs)
+                    ),
+                )
+                # Mocking this to get around grad issues.
+                with mock.patch(
+                    f"{optimize_acqf.__module__}.gen_candidates_scipy",
+                    return_value=(
+                        torch.zeros(2, n_f + 1, 2, **tkwargs),
+                        torch.zeros(2, **tkwargs),
+                    ),
+                ), mock.patch(
+                    f"{optimize_acqf.__module__}._filter_kwargs",
+                    wraps=lambda f, **kwargs: _filter_kwargs(
+                        function=gen_candidates_scipy, **kwargs
+                    ),
+                ):
+
+                    candidate, value = optimize_acqf(
+                        acq_function=kg,
+                        bounds=bounds,
+                        q=1,
+                        num_restarts=2,
+                        raw_samples=2,
+                        options=options,
+                    )
+            self.assertTrue(torch.equal(candidate, torch.zeros(1, 2, **tkwargs)))
 
 
 class TestKGUtils(BotorchTestCase):
@@ -519,11 +620,15 @@ class TestKGUtils(BotorchTestCase):
             mm = MockModel(None)
             # test PosteriorMean
             vf = _get_value_function(mm)
+            # test initialization
+            self.assertIn("model", vf._modules)
+            self.assertEqual(vf._modules["model"], mm)
+
             self.assertIsInstance(vf, PosteriorMean)
-            self.assertIsNone(vf.objective)
+            self.assertIsNone(vf.posterior_transform)
             # test SimpleRegret
             obj = GenericMCObjective(lambda Y, X: Y.sum(dim=-1))
-            sampler = IIDNormalSampler(num_samples=2)
+            sampler = IIDNormalSampler(sample_shape=torch.Size([2]))
             vf = _get_value_function(model=mm, objective=obj, sampler=sampler)
             self.assertIsInstance(vf, qSimpleRegret)
             self.assertEqual(vf.objective, obj)

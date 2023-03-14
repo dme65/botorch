@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -39,7 +39,7 @@ class TestBaseTestProblems(BotorchTestCase):
             self.assertTrue(torch.equal(problem.bounds, bnds_expected))
             X = torch.rand(2, 2, device=self.device, dtype=dtype)
             Y = problem(X)
-            self.assertTrue(torch.allclose(Y, -X.pow(2).sum(dim=-1)))
+            self.assertAllClose(Y, -X.pow(2).sum(dim=-1))
             problem = DummyTestProblem(negate=True, noise_std=0.1)
             self.assertEqual(problem.noise_std, 0.1)
             self.assertTrue(problem.negate)

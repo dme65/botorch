@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -23,7 +23,7 @@ class TestCostModels(BotorchTestCase):
                 self.assertEqual(model.fixed_cost, 0.01)
                 cost = model(X)
                 cost_exp = 0.01 + X[..., -1:]
-                self.assertTrue(torch.allclose(cost, cost_exp))
+                self.assertAllClose(cost, cost_exp)
                 # test custom parameters
                 fw = {2: 2.0, 0: 1.0}
                 fc = random()
@@ -32,4 +32,4 @@ class TestCostModels(BotorchTestCase):
                 self.assertEqual(model.fixed_cost, fc)
                 cost = model(X)
                 cost_exp = fc + sum(v * X[..., i : i + 1] for i, v in fw.items())
-                self.assertTrue(torch.allclose(cost, cost_exp))
+                self.assertAllClose(cost, cost_exp)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -12,10 +12,14 @@ from __future__ import annotations
 
 import warnings
 from functools import wraps
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, TYPE_CHECKING
 
 import torch
 from torch import Tensor
+
+if TYPE_CHECKING:
+    from botorch.acquisition import AcquisitionFunction  # pragma: no cover
+    from botorch.model import Model  # pragma: no cover
 
 
 def squeeze_last_dim(Y: Tensor) -> Tensor:
@@ -148,27 +152,86 @@ def _verify_output_shape(acqf: Any, X: Tensor, output: Tensor) -> bool:
         True if `output` has the correct shape, False otherwise.
     """
     try:
-        return (
-            output.shape == X.shape[:-2]
-            or (output.shape == torch.Size() and X.shape[:-2] == torch.Size([1]))
-            or output.shape == acqf.model.batch_shape
-        )
+        X_batch_shape = X.shape[:-2]
+        if output.shape == X_batch_shape:
+            return True
+        if output.shape == torch.Size() and X_batch_shape == torch.Size([1]):
+            # X has a batch shape of [1] which gets squeezed.
+            return True
+        # Cases with model batch shape involved.
+        model_b_shape = acqf.model.batch_shape
+        if output.shape == model_b_shape:
+            # Simple inputs with batched model.
+            return True
+        model_b_dim = len(model_b_shape)
+        if output.shape == X_batch_shape[:-model_b_dim] + model_b_shape and all(
+            xs in [1, ms] for xs, ms in zip(X_batch_shape[-model_b_dim:], model_b_shape)
+        ):
+            # X has additional batch dimensions beyond the model batch shape.
+            # For a batched model, some of the input dimensions might get broadcasted
+            # to the model batch shape. In that case the acquisition function output
+            # should replace the right-most batch dim of X with the model's batch shape.
+            return True
+        return False
     except (AttributeError, NotImplementedError):
         # acqf does not have model or acqf.model does not define `batch_shape`
         warnings.warn(
             "Output shape checks failed! Expected output shape to match t-batch shape"
             f"of X, but got output with shape {output.shape} for X with shape"
-            "{X.shape}. Make sure that this is the intended behavior!",
+            f"{X.shape}. Make sure that this is the intended behavior!",
             RuntimeWarning,
         )
         return True
 
 
+def is_fully_bayesian(model: Model) -> bool:
+    r"""Check if at least one model is a SaasFullyBayesianSingleTaskGP
+
+    Args:
+        model: A BoTorch model (may be a `ModelList` or `ModelListGP`)
+        d: The dimension of the tensor to index.
+
+    Returns:
+        True if at least one model is a `SaasFullyBayesianSingleTaskGP`
+    """
+    from botorch.models import ModelList, ModelListGP
+    from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
+    from botorch.models.fully_bayesian_multitask import SaasFullyBayesianMultiTaskGP
+
+    full_bayesian_model_cls = [
+        SaasFullyBayesianSingleTaskGP,
+        SaasFullyBayesianMultiTaskGP,
+    ]
+
+    if any(
+        isinstance(model, m_cls) or getattr(model, "is_fully_bayesian", False)
+        for m_cls in full_bayesian_model_cls
+    ):
+        return True
+    elif isinstance(model, ModelList):
+        for m in model.models:
+            if any(
+                isinstance(m, m_cls) or getattr(model, "is_fully_bayesian", False)
+                for m_cls in full_bayesian_model_cls
+            ):
+                return True
+            elif isinstance(m, ModelListGP) and any(
+                isinstance(m_sub, m_cls)
+                for m_sub in m.models
+                for m_cls in full_bayesian_model_cls
+            ):
+                return True
+    return False
+
+
 def t_batch_mode_transform(
     expected_q: Optional[int] = None,
     assert_output_shape: bool = True,
-) -> Callable[[Callable[[Any, Tensor], Any]], Callable[[Any, Tensor], Any]]:
-    r"""Factory for decorators taking a t-batched `X` tensor.
+) -> Callable[
+    [Callable[[AcquisitionFunction, Any], Any]],
+    Callable[[AcquisitionFunction, Any], Any],
+]:
+    r"""Factory for decorators enabling consistent t-batch behavior.
 
     This method creates decorators for instance methods to transform an input tensor
     `X` to t-batch mode (i.e. with at least 3 dimensions). This assumes the tensor
@@ -176,10 +239,10 @@ def t_batch_mode_transform(
     is provided, and the output shape if `assert_output_shape` is `True`.
 
     Args:
-        expected_q: The expected q-batch size of X. If specified, this will raise an
-            AssertionError if X's q-batch size does not equal expected_q.
+        expected_q: The expected q-batch size of `X`. If specified, this will raise an
+            AssertionError if `X`'s q-batch size does not equal expected_q.
         assert_output_shape: If `True`, this will raise an AssertionError if the
-            output shape does not match either the t-batch shape of X,
+            output shape does not match either the t-batch shape of `X`,
             or the `acqf.model.batch_shape` for acquisition functions using
             batched models.
 
@@ -197,9 +260,18 @@ def t_batch_mode_transform(
         >>>         ...
     """
 
-    def decorator(method: Callable[[Any, Tensor], Any]) -> Callable[[Any, Tensor], Any]:
+    def decorator(
+        method: Callable[[AcquisitionFunction, Any], Any],
+    ) -> Callable[[AcquisitionFunction, Any], Any]:
         @wraps(method)
-        def decorated(acqf: Any, X: Tensor, *args: Any, **kwargs: Any) -> Any:
+        def decorated(
+            acqf: AcquisitionFunction, X: Any, *args: Any, **kwargs: Any
+        ) -> Any:
+
+            # Allow using acquisition functions for other inputs (e.g. lists of strings)
+            if not isinstance(X, Tensor):
+                return method(acqf, X, *args, **kwargs)
+
             if X.dim() < 2:
                 raise ValueError(
                     f"{type(acqf).__name__} requires X to have at least 2 dimensions,"
@@ -210,8 +282,11 @@ def t_batch_mode_transform(
                     f"Expected X to be `batch_shape x q={expected_q} x d`, but"
                     f" got X with shape {X.shape}."
                 )
+            # add t-batch dim
             X = X if X.dim() > 2 else X.unsqueeze(0)
             output = method(acqf, X, *args, **kwargs)
+            if hasattr(acqf, "model") and is_fully_bayesian(acqf.model):
+                output = output.mean(dim=-1)
             if assert_output_shape and not _verify_output_shape(
                 acqf=acqf,
                 X=X,
@@ -219,9 +294,9 @@ def t_batch_mode_transform(
             ):
                 raise AssertionError(
                     "Expected the output shape to match either the t-batch shape of "
-                    "X, or the `model.batch_shape` in the case of acquisition functions"
-                    f"using batch models; but got output with shape {output.shape}"
-                    f"for X with shape {X.shape}."
+                    "X, or the `model.batch_shape` in the case of acquisition "
+                    "functions using batch models; but got output with shape "
+                    f"{output.shape} for X with shape {X.shape}."
                 )
             return output
 

@@ -1,5 +1,5 @@
 #! /usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -15,6 +15,13 @@ from botorch.utils.multi_objective.box_decompositions.box_decomposition import (
     BoxDecomposition,
     FastPartitioning,
 )
+from botorch.utils.multi_objective.box_decompositions.dominated import (
+    DominatedPartitioning,
+)
+from botorch.utils.multi_objective.box_decompositions.non_dominated import (
+    FastNondominatedPartitioning,
+    NondominatedPartitioning,
+)
 from botorch.utils.multi_objective.box_decompositions.utils import (
     update_local_upper_bounds_incremental,
 )
@@ -22,13 +29,10 @@ from botorch.utils.testing import BotorchTestCase
 
 
 class DummyBoxDecomposition(BoxDecomposition):
-    def partition_space_2d(self):
-        pass
-
     def _partition_space(self):
         pass
 
-    def compute_hypervolume(self):
+    def _compute_hypervolume_if_y_has_data(self):
         pass
 
     def get_hypercell_bounds(self):
@@ -62,7 +66,7 @@ class TestBoxDecomposition(BotorchTestCase):
             device=self.device,
         )
 
-    def test_box_decomposition(self):
+    def test_box_decomposition(self) -> None:
         with self.assertRaises(TypeError):
             BoxDecomposition()
         for dtype, m, sort in product(
@@ -70,7 +74,7 @@ class TestBoxDecomposition(BotorchTestCase):
         ):
             with mock.patch.object(
                 DummyBoxDecomposition,
-                "partition_space_2d" if m == 2 else "partition_space",
+                "_partition_space_2d" if m == 2 else "_partition_space",
             ) as mock_partition_space:
 
                 ref_point = self.ref_point_raw[:m].to(dtype=dtype)
@@ -208,9 +212,30 @@ class TestBoxDecomposition(BotorchTestCase):
             with mock.patch.object(
                 DummyFastPartitioning,
                 "reset",
+                wraps=bd.reset,
             ) as mock_reset:
                 bd.update(Y=Y[0:])
                 mock_reset.assert_called_once()
+
+            # test empty pareto Y
+            bd = DummyFastPartitioning(ref_point=ref_point)
+            with mock.patch.object(
+                DummyFastPartitioning,
+                "_get_single_cell",
+                wraps=bd._get_single_cell,
+            ) as mock_get_single_cell:
+                bd.update(Y=Y[:0])
+                mock_get_single_cell.assert_called_once()
+            # test batched empty pareto Y
+            if m == 2:
+                bd = DummyFastPartitioning(ref_point=ref_point)
+                with mock.patch.object(
+                    DummyFastPartitioning,
+                    "_get_single_cell",
+                    wraps=bd._get_single_cell,
+                ) as mock_get_single_cell:
+                    bd.update(Y=Y.unsqueeze(0)[:, :0])
+                    mock_get_single_cell.assert_called_once()
 
             # test that update_local_upper_bounds_incremental is called when m>2
             bd = DummyFastPartitioning(ref_point=ref_point)
@@ -222,7 +247,10 @@ class TestBoxDecomposition(BotorchTestCase):
                 DummyFastPartitioning,
                 "_get_partitioning",
                 wraps=bd._get_partitioning,
-            ) as mock_get_partitioning:
+            ) as mock_get_partitioning, mock.patch.object(
+                DummyFastPartitioning,
+                "_partition_space_2d",
+            ):
                 bd.update(Y=Y)
                 if m > 2:
                     mock_update_local_upper_bounds_incremental.assert_called_once()
@@ -235,3 +263,75 @@ class TestBoxDecomposition(BotorchTestCase):
                         len(mock_update_local_upper_bounds_incremental.call_args_list),
                         0,
                     )
+
+            # test exception is raised for m=2, batched box decomposition using
+            # _partition_space
+            if m == 2:
+                with self.assertRaises(NotImplementedError):
+                    DummyFastPartitioning(ref_point=ref_point, Y=Y.unsqueeze(0))
+
+    def test_nan_values(self) -> None:
+        Y = torch.rand(10, 2)
+        Y[8:, 1] = float("nan")
+        ref_pt = torch.rand(2)
+        # On init.
+        with self.assertRaisesRegex(ValueError, "with 2 NaN values"):
+            DummyBoxDecomposition(ref_point=ref_pt, sort=True, Y=Y)
+        # On update.
+        bd = DummyBoxDecomposition(ref_point=ref_pt, sort=True)
+        with self.assertRaisesRegex(ValueError, "with 2 NaN values"):
+            bd.update(Y=Y)
+
+
+class TestBoxDecomposition_no_set_up(BotorchTestCase):
+    def helper_hypervolume(self, Box_Decomp_cls: type) -> None:
+        """
+        This test should be run for each non-abstract subclass of `BoxDecomposition`.
+        """
+        # batching
+        n_outcomes, batch_dim, n = 2, 3, 4
+
+        ref_point = torch.zeros(n_outcomes)
+        Y = torch.ones(batch_dim, n, n_outcomes)
+
+        box_decomp = Box_Decomp_cls(ref_point=ref_point, Y=Y)
+        hv = box_decomp.compute_hypervolume()
+        self.assertEqual(hv.shape, (batch_dim,))
+        self.assertAllClose(hv, torch.ones(batch_dim))
+
+        # no batching
+        Y = torch.ones(n, n_outcomes)
+
+        box_decomp = Box_Decomp_cls(ref_point=ref_point, Y=Y)
+        hv = box_decomp.compute_hypervolume()
+        self.assertEqual(hv.shape, ())
+        self.assertAllClose(hv, torch.tensor(1.0))
+
+        # cases where there is nothing in Y, either because n=0 or Y is None
+        n = 0
+        Y_and_expected_shape = [
+            (torch.ones(batch_dim, n, n_outcomes), (batch_dim,)),
+            (torch.ones(n, n_outcomes), ()),
+            (None, ()),
+        ]
+        for Y, expected_shape in Y_and_expected_shape:
+            box_decomp = Box_Decomp_cls(ref_point=ref_point, Y=Y)
+            hv = box_decomp.compute_hypervolume()
+            self.assertEqual(hv.shape, expected_shape)
+            self.assertAllClose(hv, torch.zeros(expected_shape))
+
+    def test_hypervolume(self) -> None:
+        for cl in [
+            NondominatedPartitioning,
+            DominatedPartitioning,
+            FastNondominatedPartitioning,
+        ]:
+            self.helper_hypervolume(cl)
+
+    def test_uninitialized_y(self) -> None:
+        ref_point = torch.zeros(2)
+        box_decomp = NondominatedPartitioning(ref_point=ref_point)
+        with self.assertRaises(BotorchError):
+            box_decomp.Y
+        with self.assertRaises(BotorchError):
+            box_decomp._compute_pareto_Y()

@@ -1,5 +1,5 @@
 #! /usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -136,10 +136,6 @@ class TestNonDominatedPartitioning(BotorchTestCase):
                 cell_bounds2 = partitioning.get_hypercell_bounds()
                 self.assertTrue(torch.equal(cell_bounds, cell_bounds2))
 
-                # test improper batch shape
-                # with self.assertRaises(BotorchTensorDimensionError):
-                #     partitioning.get_hypercell_bounds()
-
                 # test improper Y shape (too many batch dims)
                 with self.assertRaises(NotImplementedError):
                     NondominatedPartitioning(ref_point=ref_point, Y=Y.unsqueeze(0))
@@ -153,7 +149,7 @@ class TestNonDominatedPartitioning(BotorchTestCase):
                     ],
                     dim=0,
                 )
-                self.assertTrue(torch.allclose(hvs, hvs_non_batch))
+                self.assertAllClose(hvs, hvs_non_batch)
 
             # test batched m>2
             ref_point = torch.zeros(3, **tkwargs)

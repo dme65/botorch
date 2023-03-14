@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -20,13 +20,17 @@ from botorch import settings
 from botorch.acquisition.objective import IdentityMCObjective, MCAcquisitionObjective
 from botorch.exceptions.warnings import CostAwareWarning
 from botorch.models.model import Model
-from botorch.sampling.samplers import MCSampler
+from botorch.sampling.base import MCSampler
 from torch import Tensor
 from torch.nn import Module
 
 
 class CostAwareUtility(Module, ABC):
-    r"""Abstract base class for cost-aware utilities."""
+    r"""
+    Abstract base class for cost-aware utilities.
+
+    :meta private:
+    """
 
     @abstractmethod
     def forward(self, X: Tensor, deltas: Tensor, **kwargs: Any) -> Tensor:

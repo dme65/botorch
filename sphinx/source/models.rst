@@ -10,7 +10,7 @@ botorch.models
 Model APIs
 -------------------------------------------
 
-Abstract Model API
+Base Model API
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.models.model
     :members:
@@ -23,6 +23,11 @@ GPyTorch Model API
 Deterministic Model API
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.models.deterministic
+    :members:
+
+Ensemble Model API
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.models.ensemble
     :members:
 
 
@@ -42,6 +47,11 @@ GP Regression Models
 Multi-Fidelity GP Regression Models
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.models.gp_regression_fidelity
+    :members:
+
+GP Regression Models for Mixed Parameter Spaces
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.models.gp_regression_mixed
     :members:
 
 Model List GP Regression Models
@@ -74,12 +84,30 @@ Contextual GP Models with Context Rewards
 .. automodule:: botorch.models.contextual_multioutput
     :members:
 
+Variational GP Models
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.models.approximate_gp
+    :members:
+
+Fully Bayesian GP Models
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.models.fully_bayesian
+    :members:
+
+Fully Bayesian Multitask GP Models
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.models.fully_bayesian_multitask
+    :members:
+
 
 Model Components
 -------------------------------------------
 
 Kernels
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.models.kernels.categorical
+.. autoclass:: CategoricalKernel
+
 .. automodule:: botorch.models.kernels.downsampling
 .. autoclass:: DownsamplingKernel
 
@@ -95,6 +123,10 @@ Kernels
 .. automodule:: botorch.models.kernels.contextual_sac
 .. autoclass:: SACKernel
 
+Likelihoods
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.models.likelihoods.pairwise
+    :members:
 
 Transforms
 -------------------------------------------
@@ -109,6 +141,11 @@ Input Transforms
 .. automodule:: botorch.models.transforms.input
     :members:
 
+Transform Factory Methods
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.models.transforms.factory
+    :members:
+
 Transform Utilities
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.models.transforms.utils
@@ -118,12 +155,23 @@ Transform Utilities
 Utilities
 -------------------------------------------
 
+Dataset Parsing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.models.utils.parse_training_data
+    :members:
+
 Model Conversion
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. automodule:: botorch.models.converter
     :members:
 
+Inducing Point Allocators
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: botorch.models.utils.inducing_point_allocators
+    :members:
+    :private-members: _pivoted_cholesky_init
+
 Other Utilties
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-.. automodule:: botorch.models.utils
+.. automodule:: botorch.models.utils.assorted
     :members:

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -114,7 +114,7 @@ class Index extends React.Component {
     const modelFitCodeExample = `${pre}python
 import torch
 from botorch.models import SingleTaskGP
-from botorch.fit import fit_gpytorch_model
+from botorch.fit import fit_gpytorch_mll
 from botorch.utils import standardize
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
@@ -125,7 +125,7 @@ train_Y = standardize(Y)
 
 gp = SingleTaskGP(train_X, train_Y)
 mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
-fit_gpytorch_model(mll)
+fit_gpytorch_mll(mll)
     `;
     // Example for defining an acquisition function
     const constrAcqFuncExample = `${pre}python
@@ -164,8 +164,8 @@ candidate  # tensor([0.4887, 0.5063])
           <ol>
             <li>
               <h4>Install BoTorch:</h4>
-              <a>via conda (recommended):</a>
-              <MarkdownBlock>{bash`conda install botorch -c pytorch -c gpytorch`}</MarkdownBlock>
+              <a>via Conda (strongly recommended for OSX):</a>
+              <MarkdownBlock>{bash`conda install botorch -c pytorch -c gpytorch -c conda-forge`}</MarkdownBlock>
               <a>via pip:</a>
               <MarkdownBlock>{bash`pip install botorch`}</MarkdownBlock>
             </li>

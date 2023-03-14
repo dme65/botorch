@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -79,7 +79,9 @@ class TestCostAwareUtilities(BotorchTestCase):
                 )
                 mm = MockModel(MockPosterior(samples=samples))
                 icwu = InverseCostWeightedUtility(mm, use_mean=False)
-                ratios = icwu(X, deltas, sampler=IIDNormalSampler(4))
+                ratios = icwu(
+                    X, deltas, sampler=IIDNormalSampler(sample_shape=torch.Size([4]))
+                )
                 self.assertTrue(
                     torch.equal(ratios, deltas / samples.squeeze(-1).sum(dim=-1))
                 )

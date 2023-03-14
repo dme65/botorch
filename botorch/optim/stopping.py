@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -18,6 +18,8 @@ class StoppingCriterion(ABC):
 
     Stopping criteria are implemented as a objects rather than a function, so that they
     can keep track of past function values between optimization steps.
+
+    :meta private:
     """
 
     @abstractmethod
@@ -34,6 +36,9 @@ class StoppingCriterion(ABC):
             Stopping indicator (if True, stop the optimziation).
         """
         pass  # pragma: no cover
+
+    def __call__(self, fvals: Tensor) -> bool:
+        return self.evaluate(fvals)
 
 
 class ExpMAStoppingCriterion(StoppingCriterion):

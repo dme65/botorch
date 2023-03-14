@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -33,7 +33,7 @@ class NormalQMCEngine:
 
     Example:
         >>> engine = NormalQMCEngine(3)
-        >>> samples = engine.draw(10)
+        >>> samples = engine.draw(16)
     """
 
     def __init__(
@@ -63,7 +63,7 @@ class NormalQMCEngine:
         r"""Draw `n` qMC samples from the standard Normal.
 
         Args:
-            n: The number of samples to draw.
+            n: The number of samples to draw. As a best practice, use powers of 2.
             out: An option output tensor. If provided, draws are put into this
                 tensor, and the function returns None.
             dtype: The desired torch data type (ignored if `out` is provided).
@@ -104,7 +104,7 @@ class MultivariateNormalQMCEngine:
         >>> mean = torch.tensor([1.0, 2.0])
         >>> cov = torch.tensor([[1.0, 0.25], [0.25, 2.0]])
         >>> engine = MultivariateNormalQMCEngine(mean, cov)
-        >>> samples = engine.draw(10)
+        >>> samples = engine.draw(16)
     """
 
     def __init__(
@@ -136,10 +136,11 @@ class MultivariateNormalQMCEngine:
         )
         # compute Cholesky decomp; if it fails, do the eigendecomposition
         try:
-            self._corr_matrix = torch.cholesky(cov).transpose(-1, -2)
+            self._corr_matrix = torch.linalg.cholesky(cov).transpose(-1, -2)
         except RuntimeError:
-            eigval, eigvec = torch.symeig(cov, eigenvectors=True)
-            if not torch.all(eigval >= -1e-8):
+            eigval, eigvec = torch.linalg.eigh(cov)
+            tol = 1e-8 if eigval.dtype == torch.double else 1e-6
+            if torch.any(eigval < -tol):
                 raise ValueError("Covariance matrix not PSD.")
             eigval_root = eigval.clamp_min(0.0).sqrt()
             self._corr_matrix = (eigvec * eigval_root).transpose(-1, -2)
@@ -148,7 +149,7 @@ class MultivariateNormalQMCEngine:
         r"""Draw `n` qMC samples from the multivariate Normal.
 
         Args:
-            n: The number of samples to draw.
+            n: The number of samples to draw. As a best practice, use powers of 2.
             out: An option output tensor. If provided, draws are put into this
                 tensor, and the function returns None.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -11,25 +11,28 @@ Utilities for acquisition functions.
 from __future__ import annotations
 
 import math
-import warnings
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 import torch
-from botorch import settings
-from botorch.acquisition import analytic, multi_objective
-from botorch.acquisition import monte_carlo  # noqa F401
+from botorch.acquisition import analytic, monte_carlo, multi_objective  # noqa F401
 from botorch.acquisition.acquisition import AcquisitionFunction
 from botorch.acquisition.multi_objective import monte_carlo as moo_monte_carlo
-from botorch.acquisition.objective import IdentityMCObjective, MCAcquisitionObjective
+from botorch.acquisition.objective import (
+    IdentityMCObjective,
+    MCAcquisitionObjective,
+    PosteriorTransform,
+)
 from botorch.exceptions.errors import UnsupportedError
-from botorch.exceptions.warnings import SamplingWarning
+from botorch.models.fully_bayesian import MCMC_DIM
 from botorch.models.model import Model
-from botorch.sampling.samplers import IIDNormalSampler, MCSampler, SobolQMCNormalSampler
+from botorch.sampling.base import MCSampler
+from botorch.sampling.get_sampler import get_sampler
 from botorch.utils.multi_objective.box_decompositions.non_dominated import (
+    FastNondominatedPartitioning,
     NondominatedPartitioning,
 )
+from botorch.utils.transforms import is_fully_bayesian
 from torch import Tensor
-from torch.quasirandom import SobolEngine
 
 
 def get_acquisition_function(
@@ -37,10 +40,11 @@ def get_acquisition_function(
     model: Model,
     objective: MCAcquisitionObjective,
     X_observed: Tensor,
+    posterior_transform: Optional[PosteriorTransform] = None,
     X_pending: Optional[Tensor] = None,
     constraints: Optional[List[Callable[[Tensor], Tensor]]] = None,
-    mc_samples: int = 500,
-    qmc: bool = True,
+    eta: Optional[Union[Tensor, float]] = 1e-3,
+    mc_samples: int = 512,
     seed: Optional[int] = None,
     **kwargs,
 ) -> monte_carlo.MCAcquisitionFunction:
@@ -52,16 +56,21 @@ def get_acquisition_function(
         objective: A MCAcquisitionObjective.
         X_observed: A `m1 x d`-dim Tensor of `m1` design points that have
             already been observed.
+        posterior_transform: A PosteriorTransform (optional).
         X_pending: A `m2 x d`-dim Tensor of `m2` design points whose evaluation
             is pending.
         constraints: A list of callables, each mapping a Tensor of dimension
             `sample_shape x batch-shape x q x m` to a Tensor of dimension
             `sample_shape x batch-shape x q`, where negative values imply
-            feasibility. Used when constraint_transforms are not passed
-            as part of the objective.
+            feasibility. Used only for qEHVI and qNEHVI.
+        eta: The temperature parameter for the sigmoid function used for the
+            differentiable approximation of the constraints. In case of a float the
+            same eta is used for every constraint in constraints. In case of a
+            tensor the length of the tensor must match the number of provided
+            constraints. The i-th constraint is then estimated with the i-th
+            eta value. Used only for qEHVI and qNEHVI.
         mc_samples: The number of samples to use for (q)MC evaluation of the
             acquisition function.
-        qmc: If True, use quasi-Monte-Carlo sampling (instead of iid).
         seed: If provided, perform deterministic optimization (i.e. the
             function to optimize is fixed and not stochastic).
 
@@ -74,27 +83,41 @@ def get_acquisition_function(
         >>> acqf = get_acquisition_function("qEI", model, obj, train_X)
     """
     # initialize the sampler
-    if qmc:
-        sampler = SobolQMCNormalSampler(num_samples=mc_samples, seed=seed)
-    else:
-        sampler = IIDNormalSampler(num_samples=mc_samples, seed=seed)
+    sampler = get_sampler(
+        posterior=model.posterior(X_observed[:1]),
+        sample_shape=torch.Size([mc_samples]),
+        seed=seed,
+    )
+    if posterior_transform is not None and acquisition_function_name in [
+        "qEHVI",
+        "qNEHVI",
+    ]:
+        raise NotImplementedError(
+            "PosteriorTransforms are not yet implemented for multi-objective "
+            "acquisition functions."
+        )
     # instantiate and return the requested acquisition function
+    if acquisition_function_name in ("qEI", "qPI"):
+        obj = objective(
+            model.posterior(X_observed, posterior_transform=posterior_transform).mean
+        )
+        best_f = obj.max(dim=-1).values
     if acquisition_function_name == "qEI":
-        best_f = objective(model.posterior(X_observed).mean).max().item()
         return monte_carlo.qExpectedImprovement(
             model=model,
             best_f=best_f,
             sampler=sampler,
             objective=objective,
+            posterior_transform=posterior_transform,
             X_pending=X_pending,
         )
     elif acquisition_function_name == "qPI":
-        best_f = objective(model.posterior(X_observed).mean).max().item()
         return monte_carlo.qProbabilityOfImprovement(
             model=model,
             best_f=best_f,
             sampler=sampler,
             objective=objective,
+            posterior_transform=posterior_transform,
             X_pending=X_pending,
             tau=kwargs.get("tau", 1e-3),
         )
@@ -104,12 +127,19 @@ def get_acquisition_function(
             X_baseline=X_observed,
             sampler=sampler,
             objective=objective,
+            posterior_transform=posterior_transform,
             X_pending=X_pending,
             prune_baseline=kwargs.get("prune_baseline", False),
+            marginalize_dim=kwargs.get("marginalize_dim"),
+            cache_root=kwargs.get("cache_root", True),
         )
     elif acquisition_function_name == "qSR":
         return monte_carlo.qSimpleRegret(
-            model=model, sampler=sampler, objective=objective, X_pending=X_pending
+            model=model,
+            sampler=sampler,
+            objective=objective,
+            posterior_transform=posterior_transform,
+            X_pending=X_pending,
         )
     elif acquisition_function_name == "qUCB":
         if "beta" not in kwargs:
@@ -119,6 +149,7 @@ def get_acquisition_function(
             beta=kwargs["beta"],
             sampler=sampler,
             objective=objective,
+            posterior_transform=posterior_transform,
             X_pending=X_pending,
         )
     elif acquisition_function_name == "qEHVI":
@@ -136,11 +167,18 @@ def get_acquisition_function(
             feas = torch.stack([c(Y) <= 0 for c in constraints], dim=-1).all(dim=-1)
             Y = Y[feas]
         obj = objective(Y)
-        partitioning = NondominatedPartitioning(
-            ref_point=torch.as_tensor(ref_point, dtype=Y.dtype, device=Y.device),
-            Y=obj,
-            alpha=kwargs.get("alpha", 0.0),
-        )
+        alpha = kwargs.get("alpha", 0.0)
+        if alpha > 0:
+            partitioning = NondominatedPartitioning(
+                ref_point=torch.as_tensor(ref_point, dtype=Y.dtype, device=Y.device),
+                Y=obj,
+                alpha=alpha,
+            )
+        else:
+            partitioning = FastNondominatedPartitioning(
+                ref_point=torch.as_tensor(ref_point, dtype=Y.dtype, device=Y.device),
+                Y=obj,
+            )
         return moo_monte_carlo.qExpectedHypervolumeImprovement(
             model=model,
             ref_point=ref_point,
@@ -148,7 +186,25 @@ def get_acquisition_function(
             sampler=sampler,
             objective=objective,
             constraints=constraints,
+            eta=eta,
             X_pending=X_pending,
+        )
+    elif acquisition_function_name == "qNEHVI":
+        if "ref_point" not in kwargs:
+            raise ValueError("`ref_point` must be specified in kwargs for qNEHVI")
+        return moo_monte_carlo.qNoisyExpectedHypervolumeImprovement(
+            model=model,
+            ref_point=kwargs["ref_point"],
+            X_baseline=X_observed,
+            sampler=sampler,
+            objective=objective,
+            constraints=constraints,
+            eta=eta,
+            prune_baseline=kwargs.get("prune_baseline", True),
+            alpha=kwargs.get("alpha", 0.0),
+            X_pending=X_pending,
+            marginalize_dim=kwargs.get("marginalize_dim"),
+            cache_root=kwargs.get("cache_root", True),
         )
     raise NotImplementedError(
         f"Unknown acquisition function {acquisition_function_name}"
@@ -159,21 +215,23 @@ def get_infeasible_cost(
     X: Tensor,
     model: Model,
     objective: Optional[Callable[[Tensor, Optional[Tensor]], Tensor]] = None,
-) -> float:
+    posterior_transform: Optional[PosteriorTransform] = None,
+) -> Tensor:
     r"""Get infeasible cost for a model and objective.
 
-    Computes an infeasible cost `M` such that `-M < min_x f(x)` almost always,
-        so that feasible points are preferred.
+    For each outcome, computes an infeasible cost `M` such that
+    `-M < min_x f(x)` almost always, so that feasible points are preferred.
 
     Args:
         X: A `n x d` Tensor of `n` design points to use in evaluating the
             minimum. These points should cover the design space well. The more
             points the better the estimate, at the expense of added computation.
-        model: A fitted botorch model.
+        model: A fitted botorch model with `m` outcomes.
         objective: The objective with which to evaluate the model output.
+        posterior_transform: A PosteriorTransform (optional).
 
     Returns:
-        The infeasible cost `M` value.
+        An `m`-dim tensor of infeasible cost values.
 
     Example:
         >>> model = SingleTaskGP(train_X, train_Y)
@@ -185,10 +243,14 @@ def get_infeasible_cost(
         def objective(Y: Tensor, X: Optional[Tensor] = None):
             return Y.squeeze(-1)
 
-    posterior = model.posterior(X)
-    lb = objective(posterior.mean - 6 * posterior.variance.clamp_min(0).sqrt()).min()
-    M = -(lb.clamp_max(0.0))
-    return M.item()
+    posterior = model.posterior(X, posterior_transform=posterior_transform)
+    lb = objective(posterior.mean - 6 * posterior.variance.clamp_min(0).sqrt(), X=X)
+    if lb.ndim < posterior.mean.ndim:
+        lb = lb.unsqueeze(-1)
+    # Take outcome-wise min. Looping in to handle batched models.
+    while lb.dim() > 1:
+        lb = lb.min(dim=-2).values
+    return -(lb.clamp_max(0.0))
 
 
 def is_nonnegative(acq_function: AcquisitionFunction) -> bool:
@@ -217,6 +279,7 @@ def is_nonnegative(acq_function: AcquisitionFunction) -> bool:
             monte_carlo.qProbabilityOfImprovement,
             multi_objective.analytic.ExpectedHypervolumeImprovement,
             multi_objective.monte_carlo.qExpectedHypervolumeImprovement,
+            multi_objective.monte_carlo.qNoisyExpectedHypervolumeImprovement,
         ),
     )
 
@@ -225,9 +288,11 @@ def prune_inferior_points(
     model: Model,
     X: Tensor,
     objective: Optional[MCAcquisitionObjective] = None,
+    posterior_transform: Optional[PosteriorTransform] = None,
     num_samples: int = 2048,
     max_frac: float = 1.0,
     sampler: Optional[MCSampler] = None,
+    marginalize_dim: Optional[int] = None,
 ) -> Tensor:
     r"""Prune points from an input tensor that are unlikely to be the best point.
 
@@ -242,6 +307,7 @@ def prune_inferior_points(
         X: An input tensor of shape `n x d`. Batched inputs are currently not
             supported.
         objective: The objective under which to evaluate the posterior.
+        posterior_transform: A PosteriorTransform (optional).
         num_samples: The number of samples used to compute empirical
             probabilities of being the best point.
         max_frac: The maximum fraction of points to retain. Must satisfy
@@ -249,6 +315,9 @@ def prune_inferior_points(
             returned tensor does not exceed `ceil(max_frac * n)`.
         sampler: If provided, will use this customized sampler instead of
             automatically constructing one with `num_samples`.
+        marginalize_dim: A batch dimension that should be marginalized.
+            For example, this is useful when using a batched fully Bayesian
+            model.
 
     Returns:
         A `n' x d` with subset of points in `X`, where
@@ -258,6 +327,10 @@ def prune_inferior_points(
         with `N_nz` the number of points in `X` that have non-zero (empirical,
         under `num_samples` samples) probability of being the best point.
     """
+    if marginalize_dim is None and is_fully_bayesian(model):
+        # TODO: Properly deal with marginalizing fully Bayesian models
+        marginalize_dim = MCMC_DIM
+
     if X.ndim > 2:
         # TODO: support batched inputs (req. dealing with ragged tensors)
         raise UnsupportedError(
@@ -267,28 +340,24 @@ def prune_inferior_points(
     if max_points < 1 or max_points > X.size(-2):
         raise ValueError(f"max_frac must take values in (0, 1], is {max_frac}")
     with torch.no_grad():
-        posterior = model.posterior(X=X)
+        posterior = model.posterior(X=X, posterior_transform=posterior_transform)
     if sampler is None:
-        if posterior.base_sample_shape.numel() > SobolEngine.MAXDIM:
-            if settings.debug.on():
-                warnings.warn(
-                    f"Sample dimension q*m={posterior.base_sample_shape.numel()} "
-                    f"exceeding Sobol max dimension ({SobolEngine.MAXDIM}). "
-                    "Using iid samples instead.",
-                    SamplingWarning,
-                )
-            sampler = IIDNormalSampler(num_samples=num_samples)
-        else:
-            sampler = SobolQMCNormalSampler(num_samples=num_samples)
+        sampler = get_sampler(
+            posterior=posterior, sample_shape=torch.Size([num_samples])
+        )
     samples = sampler(posterior)
     if objective is None:
         objective = IdentityMCObjective()
     obj_vals = objective(samples, X=X)
     if obj_vals.ndim > 2:
-        # TODO: support batched inputs (req. dealing with ragged tensors)
-        raise UnsupportedError(
-            "Batched models are currently unsupported by prune_inferior_points"
-        )
+        if obj_vals.ndim == 3 and marginalize_dim is not None:
+            obj_vals = obj_vals.mean(dim=marginalize_dim)
+        else:
+            # TODO: support batched inputs (req. dealing with ragged tensors)
+            raise UnsupportedError(
+                "Models with multiple batch dims are currently unsupported by"
+                " prune_inferior_points."
+            )
     is_best = torch.argmax(obj_vals, dim=-1)
     idcs, counts = torch.unique(is_best, return_counts=True)
 

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
 import itertools
-import unittest
 
 import torch
 from botorch.exceptions import UnsupportedError
@@ -54,9 +53,9 @@ class TestLinearTruncatedFidelityKernel(BotorchTestCase, BaseKernelTestCase):
                 t = 1 + t_1
 
             matern_ker = MaternKernel(nu=nu, active_dims=active_dimsM)
-            matern_term = matern_ker(x1, x2).evaluate()
+            matern_term = matern_ker(x1, x2).to_dense()
             actual = t * matern_term
-            res = kernel(x1, x2).evaluate()
+            res = kernel(x1, x2).to_dense()
             self.assertLess(torch.norm(res - actual), 1e-4)
             # test diagonal mode
             res_diag = kernel(x1, x2, diag=True)
@@ -103,9 +102,9 @@ class TestLinearTruncatedFidelityKernel(BotorchTestCase, BaseKernelTestCase):
             matern_ker = MaternKernel(
                 nu=nu, active_dims=active_dimsM, batch_shape=batch_shape
             )
-            matern_term = matern_ker(x1, x2).evaluate()
+            matern_term = matern_ker(x1, x2).to_dense()
             actual = t * matern_term
-            res = kernel(x1, x2).evaluate()
+            res = kernel(x1, x2).to_dense()
             self.assertLess(torch.norm(res - actual), 1e-4)
             # test diagonal mode
             res_diag = kernel(x1, x2, diag=True)
@@ -177,9 +176,9 @@ class TestLinearTruncatedFidelityKernel(BotorchTestCase, BaseKernelTestCase):
             fidelity_dims=[1, 2], dimension=10, active_dims=[0, 2, 4, 6]
         )
         x = self.create_data_no_batch()
-        covar_mat = kernel(x).evaluate_kernel().evaluate()
+        covar_mat = kernel(x).evaluate_kernel().to_dense()
         kernel_basic = LinearTruncatedFidelityKernel(fidelity_dims=[1, 2], dimension=4)
-        covar_mat_actual = kernel_basic(x[:, [0, 2, 4, 6]]).evaluate_kernel().evaluate()
+        covar_mat_actual = kernel_basic(x[:, [0, 2, 4, 6]]).evaluate_kernel().to_dense()
         self.assertLess(
             torch.norm(covar_mat - covar_mat_actual) / covar_mat_actual.norm(), 1e-4
         )
@@ -190,9 +189,9 @@ class TestLinearTruncatedFidelityKernel(BotorchTestCase, BaseKernelTestCase):
             fidelity_dims=[1, 2], dimension=10, active_dims=active_dims
         )
         x = self.create_data_no_batch()
-        covar_mat = kernel(x).evaluate_kernel().evaluate()
+        covar_mat = kernel(x).evaluate_kernel().to_dense()
         kernel_basic = LinearTruncatedFidelityKernel(fidelity_dims=[1, 2], dimension=6)
-        covar_mat_actual = kernel_basic(x[:, active_dims]).evaluate_kernel().evaluate()
+        covar_mat_actual = kernel_basic(x[:, active_dims]).evaluate_kernel().to_dense()
         self.assertLess(
             torch.norm(covar_mat - covar_mat_actual) / covar_mat_actual.norm(), 1e-4
         )
@@ -202,7 +201,7 @@ class TestLinearTruncatedFidelityKernel(BotorchTestCase, BaseKernelTestCase):
         x2 = torch.tensor([[0.5], [0.7]])
         kernel = LinearTruncatedFidelityKernel(fidelity_dims=[0], dimension=1, nu=2.5)
         with self.assertRaises(RuntimeError):
-            kernel(x1, x2).evaluate()
+            kernel(x1, x2).to_dense()
 
     def test_initialize_covar_module(self):
         kernel = LinearTruncatedFidelityKernel(fidelity_dims=[1, 2], dimension=3)
@@ -221,6 +220,6 @@ class TestLinearTruncatedFidelityKernel(BotorchTestCase, BaseKernelTestCase):
         self.assertTrue(isinstance(kernel2.covar_module_unbiased, RBFKernel))
         self.assertTrue(isinstance(kernel2.covar_module_biased, RBFKernel))
 
-    @unittest.skip("This kernel uses priors by default, which cause this test to fail")
     def test_kernel_pickle_unpickle(self):
-        ...
+        # This kernel uses priors by default, which cause this test to fail
+        pass

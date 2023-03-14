@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any, List, Optional
 
 import torch
@@ -41,45 +40,16 @@ class LinearTruncatedFidelityKernel(Kernel):
         polynomial kernel between `x_1[..., [f_1, f_2]]` and
         `x_2[..., [f_1, f_2]]`.
 
-    Args:
-        fidelity_dims: A list containing either one or two indices specifying
-            the fidelity parameters of the input.
-        dimension: The dimension of `x`. Unused if `active_dims` is specified.
-        power_prior: Prior for the power parameter of the polynomial kernel.
-            Default is `None`.
-        power_constraint: Constraint on the power parameter of the polynomial
-            kernel. Default is `Positive`.
-        nu: The smoothness parameter for the Matern kernel: either 1/2, 3/2,
-            or 5/2. Unused if both `covar_module_unbiased` and
-            `covar_module_biased` are specified.
-        lengthscale_prior_unbiased: Prior on the lengthscale parameter of Matern
-            kernel `k_0`. Default is `Gamma(1.1, 1/20)`.
-        lengthscale_constraint_unbiased: Constraint on the lengthscale parameter
-            of the Matern kernel `k_0`. Default is `Positive`.
-        lengthscale_prior_biased: Prior on the lengthscale parameter of Matern
-            kernels `k_i(i>0)`. Default is `Gamma(5, 1/20)`.
-        lengthscale_constraint_biased: Constraint on the lengthscale parameter
-            of the Matern kernels `k_i(i>0)`. Default is `Positive`.
-        covar_module_unbiased: Specify a custom kernel for `k_0`. If omitted,
-            use a `MaternKernel`.
-        covar_module_biased: Specify a custom kernel for the biased parts
-            `k_i(i>0)`. If omitted, use a `MaternKernel`.
-        batch_shape: If specified, use a separate lengthscale for each batch of
-            input data. If `x1` is a `batch_shape x n x d` tensor, this should
-            be `batch_shape`.
-        active_dims: Compute the covariance of a subset of input dimensions. The
-            numbers correspond to the indices of the dimensions.
-
     Example:
         >>> x = torch.randn(10, 5)
         >>> # Non-batch: Simple option
         >>> covar_module = LinearTruncatedFidelityKernel()
-        >>> covar = covar_module(x)  # Output: LazyVariable of size (10 x 10)
+        >>> covar = covar_module(x)  # Output: LinearOperator of size (10 x 10)
         >>>
         >>> batch_x = torch.randn(2, 10, 5)
         >>> # Batch: Simple option
         >>> covar_module = LinearTruncatedFidelityKernel(batch_shape = torch.Size([2]))
-        >>> covar = covar_module(x)  # Output: LazyVariable of size (2 x 10 x 10)
+        >>> covar = covar_module(x)  # Output: LinearOperator of size (2 x 10 x 10)
     """
 
     def __init__(  # noqa C901
@@ -97,6 +67,36 @@ class LinearTruncatedFidelityKernel(Kernel):
         covar_module_biased: Optional[Kernel] = None,
         **kwargs: Any,
     ) -> None:
+        """
+        Args:
+            fidelity_dims: A list containing either one or two indices specifying
+                the fidelity parameters of the input.
+            dimension: The dimension of `x`. Unused if `active_dims` is specified.
+            power_prior: Prior for the power parameter of the polynomial kernel.
+                Default is `None`.
+            power_constraint: Constraint on the power parameter of the polynomial
+                kernel. Default is `Positive`.
+            nu: The smoothness parameter for the Matern kernel: either 1/2, 3/2,
+                or 5/2. Unused if both `covar_module_unbiased` and
+                `covar_module_biased` are specified.
+            lengthscale_prior_unbiased: Prior on the lengthscale parameter of Matern
+                kernel `k_0`. Default is `Gamma(1.1, 1/20)`.
+            lengthscale_constraint_unbiased: Constraint on the lengthscale parameter
+                of the Matern kernel `k_0`. Default is `Positive`.
+            lengthscale_prior_biased: Prior on the lengthscale parameter of Matern
+                kernels `k_i(i>0)`. Default is `Gamma(5, 1/20)`.
+            lengthscale_constraint_biased: Constraint on the lengthscale parameter
+                of the Matern kernels `k_i(i>0)`. Default is `Positive`.
+            covar_module_unbiased: Specify a custom kernel for `k_0`. If omitted,
+                use a `MaternKernel`.
+            covar_module_biased: Specify a custom kernel for the biased parts
+                `k_i(i>0)`. If omitted, use a `MaternKernel`.
+            batch_shape: If specified, use a separate lengthscale for each batch of
+                input data. If `x1` is a `batch_shape x n x d` tensor, this should
+                be `batch_shape`.
+            active_dims: Compute the covariance of a subset of input dimensions. The
+                numbers correspond to the indices of the dimensions.
+        """
         if dimension is None and kwargs.get("active_dims") is None:
             raise UnsupportedError(
                 "Must specify dimension when not specifying active_dims."
@@ -181,7 +181,6 @@ class LinearTruncatedFidelityKernel(Kernel):
         self.initialize(raw_power=self.raw_power_constraint.inverse_transform(value))
 
     def forward(self, x1: Tensor, x2: Tensor, diag: bool = False, **params) -> Tensor:
-        r""""""
         if params.get("last_dim_is_batch", False):
             raise NotImplementedError(
                 "last_dim_is_batch not yet supported by LinearTruncatedFidelityKernel"
@@ -195,7 +194,7 @@ class LinearTruncatedFidelityKernel(Kernel):
         if len(active_dimsM) == 0:
             raise RuntimeError(
                 "Input to LinearTruncatedFidelityKernel must have at least one "
-                " non-fidelity dimension"
+                "non-fidelity dimension."
             )
         x1_ = x1.index_select(dim=-1, index=active_dimsM)
         x2_ = x2.index_select(dim=-1, index=active_dimsM)
@@ -237,13 +236,3 @@ class LinearTruncatedFidelityKernel(Kernel):
             bias_factor = bias_factor.view(covar_biased.shape)
 
         return covar_unbiased + bias_factor * covar_biased
-
-    def __getitem__(self, index) -> LinearTruncatedFidelityKernel:
-        new_kernel = deepcopy(self)
-        new_kernel.covar_module_unbiased = new_kernel.covar_module_unbiased[index]
-        new_kernel.covar_module_biased = new_kernel.covar_module_biased[index]
-        new_kernel.raw_power = torch.nn.Parameter(new_kernel.raw_power[index])
-        new_kernel.batch_shape = new_kernel.batch_shape[
-            1 if isinstance(index, int) else len(index) :
-        ]
-        return new_kernel

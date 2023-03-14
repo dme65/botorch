@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -15,6 +15,7 @@ from botorch.exceptions.warnings import (
     InputDataWarning,
     OptimizationWarning,
     SamplingWarning,
+    UserInputWarning,
 )
 from botorch.utils.testing import BotorchTestCase
 
@@ -28,6 +29,7 @@ class TestBotorchWarnings(BotorchTestCase):
         self.assertIsInstance(OptimizationWarning(), BotorchWarning)
         self.assertIsInstance(SamplingWarning(), BotorchWarning)
         self.assertIsInstance(BotorchTensorDimensionWarning(), BotorchWarning)
+        self.assertIsInstance(UserInputWarning(), BotorchWarning)
 
     def test_botorch_warnings(self):
         for WarningClass in (
@@ -38,6 +40,7 @@ class TestBotorchWarnings(BotorchTestCase):
             InputDataWarning,
             OptimizationWarning,
             SamplingWarning,
+            UserInputWarning,
         ):
             with warnings.catch_warnings(record=True) as ws, settings.debug(True):
                 warnings.warn("message", WarningClass)

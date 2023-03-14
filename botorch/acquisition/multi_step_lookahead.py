@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -26,16 +26,13 @@ import torch
 from botorch.acquisition import AcquisitionFunction, OneShotAcquisitionFunction
 from botorch.acquisition.analytic import AnalyticAcquisitionFunction, PosteriorMean
 from botorch.acquisition.monte_carlo import MCAcquisitionFunction
-from botorch.acquisition.objective import (
-    AcquisitionObjective,
-    MCAcquisitionObjective,
-    ScalarizedObjective,
-)
+from botorch.acquisition.objective import MCAcquisitionObjective, PosteriorTransform
 from botorch.exceptions.errors import UnsupportedError
 from botorch.exceptions.warnings import BotorchWarning
 from botorch.models.model import Model
 from botorch.optim.initializers import initialize_q_batch
-from botorch.sampling.samplers import MCSampler, SobolQMCNormalSampler
+from botorch.sampling.base import MCSampler
+from botorch.sampling.normal import SobolQMCNormalSampler
 from botorch.utils.transforms import (
     match_batch_shape,
     t_batch_mode_transform,
@@ -60,7 +57,8 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
         samplers: Optional[List[MCSampler]] = None,
         valfunc_cls: Optional[List[Optional[Type[AcquisitionFunction]]]] = None,
         valfunc_argfacs: Optional[List[Optional[TAcqfArgConstructor]]] = None,
-        objective: Optional[AcquisitionObjective] = None,
+        objective: Optional[MCAcquisitionObjective] = None,
+        posterior_transform: Optional[PosteriorTransform] = None,
         inner_mc_samples: Optional[List[int]] = None,
         X_pending: Optional[Tensor] = None,
         collapse_fantasy_base_samples: bool = True,
@@ -98,13 +96,17 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
                 `ExpectedImprovement`). If None, only the standard (`model`, `sampler`
                 and `objective`) kwargs will be used.
             objective: The objective under which the output is evaluated. If `None`, use
-                the model output (requires a single-output model). If a
-                `ScalarizedObjective` and `value_function_cls` is a subclass of
-                `AnalyticAcquisitonFunction`, then the analytic posterior mean is used.
-                Otherwise the objective is MC-evaluated (using `inner_sampler`).
+                the model output (requires a single-output model or a posterior
+                transform). Otherwise the objective is MC-evaluated
+                (using `inner_sampler`).
+            posterior_transform: An optional PosteriorTransform. If given, this
+                transforms the posterior before evaluation. If `objective is None`,
+                then the output of the transformed posterior is used. If `objective` is
+                given, the `inner_sampler` is used to draw samples from the transformed
+                posterior, which are then evaluated under the `objective`.
             inner_mc_samples: A list `[n_0, ..., n_k]` containing the number of MC
                 samples to be used for evaluating the stage value function. Ignored if
-                the objective is `None` or a `ScalarizedObjective`.
+                the objective is `None`.
             X_pending: A `m x d`-dim Tensor of `m` design points that have points that
                 have been submitted for function evaluation but have not yet been
                 evaluated. Concatenated into `X` upon forward call. Copied and set to
@@ -113,6 +115,19 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
                 will be applied on fantasy batch dimensions as well, meaning that base
                 samples are the same in all subtrees starting from the same level.
         """
+        if not isinstance(objective, MCAcquisitionObjective):
+            # TODO: clean this up after removing AcquisitionObjective.
+            if posterior_transform is None:
+                posterior_transform = self._deprecate_acqf_objective(
+                    posterior_transform=posterior_transform,
+                    objective=objective,
+                )
+                objective = None
+            else:
+                raise RuntimeError(
+                    "Got both a non-MC objective (DEPRECATED) and a posterior "
+                    "transform. Use only a posterior transform instead."
+                )
         super(MCAcquisitionFunction, self).__init__(model=model)
         self.batch_sizes = batch_sizes
         if not ((num_fantasies is None) ^ (samplers is None)):
@@ -121,14 +136,10 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
                 "`samplers` as arguments."
             )
         if samplers is None:
-            # The batch_range is not set here and left to sampler default of (0, -2),
-            # meaning that collapse_batch_dims will be applied on fantasy batch
-            # dimensions. If collapse_fantasy_base_samples is False, the batch_range
-            # is updated during the forward call.
+            # If collapse_fantasy_base_samples is False, the `batch_range_override`
+            # is set on the samplers during the forward call.
             samplers: List[MCSampler] = [
-                SobolQMCNormalSampler(
-                    num_samples=nf, resample=False, collapse_batch_dims=True
-                )
+                SobolQMCNormalSampler(sample_shape=torch.Size([nf]))
                 for nf in num_fantasies
             ]
         else:
@@ -145,11 +156,14 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
             batch_sizes=batch_sizes,
             valfunc_cls=valfunc_cls,
             objective=objective,
+            posterior_transform=posterior_transform,
             inner_mc_samples=inner_mc_samples,
         )
         if valfunc_argfacs is None:
             valfunc_argfacs = [None] * (1 + len(batch_sizes))
+
         self.objective = objective
+        self.posterior_transform = posterior_transform
         self.set_X_pending(X_pending)
         self.samplers = ModuleList(samplers)
         self.inner_samplers = ModuleList(inner_samplers)
@@ -184,6 +198,7 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
             valfunc_argfacs=self._valfunc_argfacs,
             inner_samplers=self.inner_samplers,
             objective=self.objective,
+            posterior_transform=self.posterior_transform,
             running_val=None,
         )
 
@@ -200,11 +215,11 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
         r"""Set batch_range on samplers.
 
         Args:
-            batch_shape:
+            batch_shape: The batch shape of the input tensor `X`.
         """
         tbatch_dim_start = -2 - len(batch_shape)
         for s in self.samplers:
-            s.batch_range = (tbatch_dim_start, -2)
+            s.batch_range_override = (tbatch_dim_start, -2)
 
     def get_augmented_q_batch_size(self, q: int) -> int:
         r"""Get augmented q batch size for one-shot optimzation.
@@ -219,7 +234,16 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
         return q + self._num_auxiliary
 
     def get_split_shapes(self, X: Tensor) -> Tuple[Size, List[Size], List[int]]:
-        r""""""
+        r"""Get the split shapes from X.
+
+        Args:
+            X: A `batch_shape x q_aug x d`-dim tensor including fantasy points.
+
+        Returns:
+            A 3-tuple `(batch_shape, shapes, sizes)`, where
+            `shape[i] = f_i x .... x f_1 x batch_shape x q_i x d` and
+            `size[i] = f_i * ... f_1 * q_i`.
+        """
         batch_shape, (q_aug, d) = X.shape[:-2], X.shape[-2:]
         q = q_aug - self._num_auxiliary
         batch_sizes = [q] + self.batch_sizes
@@ -228,7 +252,7 @@ class qMultiStepLookahead(MCAcquisitionFunction, OneShotAcquisitionFunction):
             torch.Size(self.num_fantasies[:i][::-1] + [*batch_shape, q_i, d])
             for i, q_i in enumerate(batch_sizes)
         ]
-        # Each X_i in Xsplit has shape batch_shape x qtilde x d with
+        # Each X_i in the split X has shape batch_shape x qtilde x d with
         # qtilde = f_i * ... * f_1 * q_i
         sizes = [s[: (-2 - len(batch_shape))].numel() * s[-2] for s in shapes]
         return batch_shape, shapes, sizes
@@ -305,7 +329,8 @@ def _step(
     valfunc_cls: List[Optional[Type[AcquisitionFunction]]],
     valfunc_argfacs: List[Optional[TAcqfArgConstructor]],
     inner_samplers: List[Optional[MCSampler]],
-    objective: AcquisitionObjective,
+    objective: MCAcquisitionObjective,
+    posterior_transform: PosteriorTransform,
     running_val: Optional[Tensor] = None,
     sample_weights: Optional[Tensor] = None,
     step_index: int = 0,
@@ -333,7 +358,9 @@ def _step(
             be used.
         inner_samplers: A list of `MCSampler` objects, each to be used in the stage
             value function at the corresponding index.
-        objective: The AcquisitionObjective under which the model output is evaluated.
+        objective: The MCAcquisitionObjective under which the model output is evaluated.
+        posterior_transform: A PosteriorTransform. Used to transform the posterior
+            before sampling / evaluating the model output.
         running_val: As `batch_shape`-dim tensor containing the current running value.
         sample_weights: A tensor of shape `f_i x .... x f_1 x batch_shape` when called
             in the `i`-th step by which to weight the stage value samples. Used in
@@ -355,6 +382,7 @@ def _step(
         valfunc_cls=valfunc_cls[0],
         X=X,
         objective=objective,
+        posterior_transform=posterior_transform,
         inner_sampler=inner_samplers[0],
         arg_fac=valfunc_argfacs[0],
     )
@@ -395,6 +423,7 @@ def _step(
         valfunc_argfacs=valfunc_argfacs[1:],
         inner_samplers=inner_samplers[1:],
         objective=objective,
+        posterior_transform=posterior_transform,
         sample_weights=sample_weights,
         running_val=running_val,
         step_index=step_index + 1,
@@ -405,7 +434,8 @@ def _compute_stage_value(
     model: Model,
     valfunc_cls: Optional[Type[AcquisitionFunction]],
     X: Tensor,
-    objective: AcquisitionObjective,
+    objective: MCAcquisitionObjective,
+    posterior_transform: PosteriorTransform,
     inner_sampler: Optional[MCSampler] = None,
     arg_fac: Optional[TAcqfArgConstructor] = None,
 ) -> Optional[Tensor]:
@@ -418,9 +448,10 @@ def _compute_stage_value(
             functions. If `None`, a zero stage value is assumed (returns `None`)
         X: A tensor with shape `f_i x .... x f_1 x batch_shape x q_i x d` when called in
             the `i`-th step.
-        objective: The AcquisitionObjective under which the model output is evaluated.
+        objective: The MCAcquisitionObjective under which the model output is evaluated.
+        posterior_transform: A PosteriorTransform.
         inner_sampler: An `MCSampler` object to be used in the stage value function. Can
-            be `None` for analytic acquisition funcitons or when using the default
+            be `None` for analytic acquisition functions or when using the default
             sampler of the acquisition function class.
         arg_fac: A callable mapping a `Model` and the input tensor `X` to a dictionary
             of kwargs for the stage value function constructor. If `None`, only the
@@ -432,9 +463,13 @@ def _compute_stage_value(
     """
     if valfunc_cls is None:
         return None
-    common_kwargs: Dict[str, Any] = {"model": model, "objective": objective}
+    common_kwargs: Dict[str, Any] = {
+        "model": model,
+        "posterior_transform": posterior_transform,
+    }
     if issubclass(valfunc_cls, MCAcquisitionFunction):
         common_kwargs["sampler"] = inner_sampler
+        common_kwargs["objective"] = objective
     kwargs = arg_fac(model=model, X=X) if arg_fac is not None else {}
     stage_val_func = valfunc_cls(**common_kwargs, **kwargs)
     # shape of stage_val is f_i x ... x f_1 x batch_shape
@@ -476,7 +511,8 @@ def _construct_inner_samplers(
     batch_sizes: List[int],
     valfunc_cls: List[Optional[Type[AcquisitionFunction]]],
     inner_mc_samples: List[Optional[int]],
-    objective: Optional[AcquisitionObjective] = None,
+    objective: Optional[MCAcquisitionObjective] = None,
+    posterior_transform: Optional[PosteriorTransform] = None,
 ) -> List[Optional[MCSampler]]:
     r"""Check validity of inputs and construct inner samplers.
 
@@ -493,10 +529,9 @@ def _construct_inner_samplers(
             samples to be used for evaluating the stage value function. Ignored if
             the objective is `None` or a `ScalarizedObjective`.
         objective: The objective under which the output is evaluated. If `None`, use
-            the model output (requires a single-output model). If a
-            `ScalarizedObjective` and `value_function_cls` is a subclass of
-            `AnalyticAcquisitonFunction`, then the analytic posterior mean is used.
+            the model output (requires a single-output model or a posterior transform).
             Otherwise the objective is MC-evaluated (using `inner_sampler`).
+        posterior_transform: A PosteriorTransform (optional).
 
     Returns:
         A list with `k + 1` elements that are either `MCSampler`s or `None.
@@ -511,10 +546,10 @@ def _construct_inner_samplers(
                 "(I see what you did there, nice try...)."
             )
         elif issubclass(vfc, AnalyticAcquisitionFunction):
-            if objective is not None and not isinstance(objective, ScalarizedObjective):
+            if objective is not None:
                 raise UnsupportedError(
-                    "Only objectives of type ScalarizedObjective are supported "
-                    "for analytic value functions."
+                    "Only PosteriorTransforms are supported for analytic value "
+                    f"functions. Received a {objective.__class__.__name__}."
                 )
             # At this point, we don't know the initial q-batch size here
             if q is not None and q > 1:
@@ -529,17 +564,8 @@ def _construct_inner_samplers(
                 )
             inner_samplers.append(None)
         else:
-            if objective is not None and not isinstance(
-                objective, MCAcquisitionObjective
-            ):
-                raise UnsupportedError(
-                    "Only objectives of type MCAcquisitionObjective are supported "
-                    "for MC value functions."
-                )
             inner_sampler = SobolQMCNormalSampler(
-                num_samples=32 if mcs is None else mcs,
-                resample=False,
-                collapse_batch_dims=True,
+                sample_shape=torch.Size([32 if mcs is None else mcs])
             )
             inner_samplers.append(inner_sampler)
     return inner_samplers

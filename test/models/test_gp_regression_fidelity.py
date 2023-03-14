@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
 import itertools
 import warnings
+from typing import Tuple
 
 import torch
-from botorch import fit_gpytorch_model
 from botorch.exceptions.errors import UnsupportedError
 from botorch.exceptions.warnings import OptimizationWarning
+from botorch.fit import fit_gpytorch_mll
 from botorch.models.gp_regression import FixedNoiseGP
 from botorch.models.gp_regression_fidelity import (
     FixedNoiseMultiFidelityGP,
@@ -19,19 +20,24 @@ from botorch.models.gp_regression_fidelity import (
 from botorch.models.transforms import Normalize, Standardize
 from botorch.posteriors import GPyTorchPosterior
 from botorch.sampling import SobolQMCNormalSampler
-from botorch.utils.containers import TrainingData
-from botorch.utils.testing import BotorchTestCase, _get_random_data
+from botorch.utils.datasets import FixedNoiseDataset, SupervisedDataset
+from botorch.utils.testing import _get_random_data, BotorchTestCase
 from gpytorch.kernels.scale_kernel import ScaleKernel
 from gpytorch.likelihoods import FixedNoiseGaussianLikelihood
 from gpytorch.means import ConstantMean
 from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
+from torch import Tensor
 
 
-def _get_random_data_with_fidelity(batch_shape, m, n_fidelity, n=10, **tkwargs):
+def _get_random_data_with_fidelity(
+    batch_shape: torch.Size, m: int, n_fidelity: int, d: int = 1, n: int = 10, **tkwargs
+) -> Tuple[Tensor, Tensor]:
     r"""Construct test data.
     For this test, by convention the trailing dimesions are the fidelity dimensions
     """
-    train_x, train_y = _get_random_data(batch_shape, m, n, **tkwargs)
+    train_x, train_y = _get_random_data(
+        batch_shape=batch_shape, m=m, d=d, n=n, **tkwargs
+    )
     s = torch.rand(n, n_fidelity, **tkwargs).repeat(batch_shape + torch.Size([1, 1]))
     train_x = torch.cat((train_x, s), dim=-1)
     train_y = train_y + (1 - s).pow(2).sum(dim=-1).unsqueeze(-1)
@@ -117,7 +123,11 @@ class TestSingleTaskMultiFidelityGP(BotorchTestCase):
                 mll.to(**tkwargs)
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=OptimizationWarning)
-                    fit_gpytorch_model(mll, sequential=False, options={"maxiter": 1})
+                    fit_gpytorch_mll(
+                        mll,
+                        optimizer_kwargs={"options": {"maxiter": 1}},
+                        sequential=False,
+                    )
 
                 # test init
                 self.assertIsInstance(model.mean_module, ConstantMean)
@@ -156,7 +166,7 @@ class TestSingleTaskMultiFidelityGP(BotorchTestCase):
                     pp_tf = model.posterior(X)
                     model.outcome_transform = tmp_tf
                     expected_var = tmp_tf.untransform_posterior(pp_tf).variance
-                    self.assertTrue(torch.allclose(posterior.variance, expected_var))
+                    self.assertAllClose(posterior.variance, expected_var)
 
                 # test batch evaluation
                 X = torch.rand(2, *batch_shape, 3, num_dim, **tkwargs)
@@ -172,7 +182,7 @@ class TestSingleTaskMultiFidelityGP(BotorchTestCase):
                     pp_tf = model.posterior(X)
                     model.outcome_transform = tmp_tf
                     expected_var = tmp_tf.untransform_posterior(pp_tf).variance
-                    self.assertTrue(torch.allclose(posterior.variance, expected_var))
+                    self.assertAllClose(posterior.variance, expected_var)
 
     def test_condition_on_observations(self):
         for (iteration_fidelity, data_fidelity) in self.FIDELITY_TEST_PAIRS:
@@ -286,8 +296,10 @@ class TestSingleTaskMultiFidelityGP(BotorchTestCase):
                         )
                         self.assertTrue(
                             torch.allclose(
-                                posterior_same_inputs.mvn.covariance_matrix[:, 0, :, :],
-                                non_batch_posterior.mvn.covariance_matrix,
+                                posterior_same_inputs.distribution.covariance_matrix[
+                                    :, 0, :, :
+                                ],
+                                non_batch_posterior.distribution.covariance_matrix,
                                 atol=1e-3,
                             )
                         )
@@ -315,7 +327,7 @@ class TestSingleTaskMultiFidelityGP(BotorchTestCase):
                 X_f = torch.rand(
                     torch.Size(batch_shape + torch.Size([4, num_dim])), **tkwargs
                 )
-                sampler = SobolQMCNormalSampler(num_samples=3)
+                sampler = SobolQMCNormalSampler(sample_shape=torch.Size([3]))
                 fm = model.fantasize(X=X_f, sampler=sampler)
                 self.assertIsInstance(fm, model.__class__)
                 fm = model.fantasize(X=X_f, sampler=sampler, observation_noise=False)
@@ -356,41 +368,35 @@ class TestSingleTaskMultiFidelityGP(BotorchTestCase):
 
     def test_construct_inputs(self):
         for (iteration_fidelity, data_fidelity) in self.FIDELITY_TEST_PAIRS:
-            for batch_shape, m, dtype, lin_trunc in itertools.product(
+            for batch_shape, dtype, lin_trunc in itertools.product(
                 (torch.Size(), torch.Size([2])),
-                (1, 2),
                 (torch.float, torch.double),
                 (False, True),
             ):
                 tkwargs = {"device": self.device, "dtype": dtype}
-                model, model_kwargs = self._get_model_and_data(
+                model, kwargs = self._get_model_and_data(
                     iteration_fidelity=iteration_fidelity,
                     data_fidelity=data_fidelity,
                     batch_shape=batch_shape,
-                    m=m,
+                    m=1,
                     lin_truncated=lin_trunc,
                     **tkwargs,
                 )
-                # len(Xs) == len(Ys) == 1
-                training_data = TrainingData(
-                    X=model_kwargs["train_X"],
-                    Y=model_kwargs["train_Y"],
-                    Yvar=torch.full_like(model_kwargs["train_Y"], 0.01),
-                )
+                training_data = SupervisedDataset(kwargs["train_X"], kwargs["train_Y"])
+
                 # missing fidelity features
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(TypeError, "argument: 'fidelity_features'"):
                     model.construct_inputs(training_data)
+
+                # multiple fidelity features
+                with self.assertRaisesRegex(UnsupportedError, "Multiple fidelity f"):
+                    model.construct_inputs(training_data, fidelity_features=[0, 1])
+
                 data_dict = model.construct_inputs(training_data, fidelity_features=[1])
-                self.assertTrue("train_Yvar" not in data_dict)
                 self.assertTrue("data_fidelity" in data_dict)
                 self.assertEqual(data_dict["data_fidelity"], 1)
-                data_dict = model.construct_inputs(training_data, fidelity_features=[1])
-                self.assertTrue(
-                    torch.equal(data_dict["train_X"], model_kwargs["train_X"])
-                )
-                self.assertTrue(
-                    torch.equal(data_dict["train_Y"], model_kwargs["train_Y"])
-                )
+                self.assertTrue(kwargs["train_X"].equal(data_dict["train_X"]))
+                self.assertTrue(kwargs["train_Y"].equal(data_dict["train_Y"]))
 
 
 class TestFixedNoiseMultiFidelityGP(TestSingleTaskMultiFidelityGP):
@@ -462,44 +468,41 @@ class TestFixedNoiseMultiFidelityGP(TestSingleTaskMultiFidelityGP):
 
     def test_construct_inputs(self):
         for (iteration_fidelity, data_fidelity) in self.FIDELITY_TEST_PAIRS:
-            for batch_shape, m, dtype, lin_trunc in itertools.product(
+            for batch_shape, dtype, lin_trunc in itertools.product(
                 (torch.Size(), torch.Size([2])),
-                (1, 2),
                 (torch.float, torch.double),
                 (False, True),
             ):
                 tkwargs = {"device": self.device, "dtype": dtype}
-                model, model_kwargs = self._get_model_and_data(
+                model, kwargs = self._get_model_and_data(
                     iteration_fidelity=iteration_fidelity,
                     data_fidelity=data_fidelity,
                     batch_shape=batch_shape,
-                    m=m,
+                    m=1,
                     lin_truncated=lin_trunc,
                     **tkwargs,
                 )
-                training_data = TrainingData(
-                    X=model_kwargs["train_X"], Y=model_kwargs["train_Y"]
-                )
-                # missing Yvars
-                with self.assertRaises(ValueError):
-                    model.construct_inputs(training_data, fidelity_features=[1])
+                training_data = SupervisedDataset(kwargs["train_X"], kwargs["train_Y"])
+                data_dict = model.construct_inputs(training_data, fidelity_features=[1])
+                self.assertTrue("train_Yvar" not in data_dict)
+
                 # len(Xs) == len(Ys) == 1
-                training_data = TrainingData(
-                    X=model_kwargs["train_X"],
-                    Y=model_kwargs["train_Y"],
-                    Yvar=torch.full_like(model_kwargs["train_Y"], 0.01),
+                training_data = FixedNoiseDataset(
+                    X=kwargs["train_X"],
+                    Y=kwargs["train_Y"],
+                    Yvar=torch.full(kwargs["train_Y"].shape[:-1] + (1,), 0.1),
                 )
+
                 # missing fidelity features
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(TypeError, "argument: 'fidelity_features'"):
                     model.construct_inputs(training_data)
+
+                # multiple fidelity features
+                with self.assertRaisesRegex(UnsupportedError, "Multiple fidelity f"):
+                    model.construct_inputs(training_data, fidelity_features=[0, 1])
+
                 data_dict = model.construct_inputs(training_data, fidelity_features=[1])
                 self.assertTrue("train_Yvar" in data_dict)
-                self.assertTrue("data_fidelity" in data_dict)
-                self.assertEqual(data_dict["data_fidelity"], 1)
-                data_dict = model.construct_inputs(training_data, fidelity_features=[1])
-                self.assertTrue(
-                    torch.equal(data_dict["train_X"], model_kwargs["train_X"])
-                )
-                self.assertTrue(
-                    torch.equal(data_dict["train_Y"], model_kwargs["train_Y"])
-                )
+                self.assertEqual(data_dict.get("data_fidelity", None), 1)
+                self.assertTrue(kwargs["train_X"].equal(data_dict["train_X"]))
+                self.assertTrue(kwargs["train_Y"].equal(data_dict["train_Y"]))

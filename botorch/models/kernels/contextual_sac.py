@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -10,8 +10,8 @@ import torch
 from gpytorch.kernels.kernel import Kernel
 from gpytorch.kernels.matern_kernel import MaternKernel
 from gpytorch.kernels.scale_kernel import ScaleKernel
-from gpytorch.lazy.sum_lazy_tensor import SumLazyTensor
 from gpytorch.priors.torch_priors import GammaPrior
+from linear_operator.operators.sum_linear_operator import SumLinearOperator
 from torch import Tensor
 from torch.nn import ModuleDict  # pyre-ignore
 
@@ -38,12 +38,6 @@ class SACKernel(Kernel):
     same number of parameters d. Each kernel `k_i` acts only on d parameters of ith
     partition i.e. `\mathbf{x}_(i)`. Each kernel `k_i` is a scaled Matern kernel
     with same lengthscales but different outputscales.
-
-    Args:
-        decomposition: Keys are context names. Values are the indexes of parameters
-            belong to the context. The parameter indexes are in the same order across
-            contexts.
-        batch_shape: Batch shape as usual for gpytorch kernels.
     """
 
     def __init__(
@@ -52,9 +46,18 @@ class SACKernel(Kernel):
         batch_shape: torch.Size,
         device: Optional[torch.device] = None,
     ) -> None:
+        r"""
+        Args:
+            decomposition: Keys are context names. Values are the indexes of parameters
+                belong to the context. The parameter indexes are in the same order
+                across contexts.
+            batch_shape: Batch shape as usual for gpytorch kernels.
+            device: The torch device.
+        """
+
         super().__init__(batch_shape=batch_shape)
         self.decomposition = decomposition
-        self.device = device
+        self._device = device
 
         num_param = len(next(iter(decomposition.values())))
         for active_parameters in decomposition.values():
@@ -83,6 +86,10 @@ class SACKernel(Kernel):
             )
         self.kernel_dict = ModuleDict(self.kernel_dict)
 
+    @property
+    def device(self) -> Optional[torch.device]:
+        return self._device
+
     def forward(
         self,
         x1: Tensor,
@@ -108,5 +115,5 @@ class SACKernel(Kernel):
         if diag:
             res = sum(covars)
         else:
-            res = SumLazyTensor(*covars)
+            res = SumLinearOperator(*covars)
         return res

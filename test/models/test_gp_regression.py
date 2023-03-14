@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -8,28 +8,29 @@ import itertools
 import warnings
 
 import torch
-from botorch import fit_gpytorch_model
 from botorch.exceptions.warnings import OptimizationWarning
+from botorch.fit import fit_gpytorch_mll
 from botorch.models.gp_regression import (
     FixedNoiseGP,
     HeteroskedasticSingleTaskGP,
     SingleTaskGP,
 )
 from botorch.models.transforms import Normalize, Standardize
+from botorch.models.transforms.input import InputStandardize
 from botorch.models.utils import add_output_dim
 from botorch.posteriors import GPyTorchPosterior
 from botorch.sampling import SobolQMCNormalSampler
-from botorch.utils.containers import TrainingData
+from botorch.utils.datasets import FixedNoiseDataset, SupervisedDataset
 from botorch.utils.sampling import manual_seed
-from botorch.utils.testing import BotorchTestCase, _get_random_data
-from gpytorch.kernels import MaternKernel, ScaleKernel
+from botorch.utils.testing import _get_random_data, BotorchTestCase
+from gpytorch.kernels import MaternKernel, RBFKernel, ScaleKernel
 from gpytorch.likelihoods import (
+    _GaussianLikelihoodBase,
     FixedNoiseGaussianLikelihood,
     GaussianLikelihood,
     HeteroskedasticNoise,
-    _GaussianLikelihoodBase,
 )
-from gpytorch.means import ConstantMean
+from gpytorch.means import ConstantMean, ZeroMean
 from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
 from gpytorch.mlls.noise_model_added_loss_term import NoiseModelAddedLossTerm
 from gpytorch.priors import GammaPrior
@@ -37,19 +38,31 @@ from gpytorch.priors import GammaPrior
 
 class TestSingleTaskGP(BotorchTestCase):
     def _get_model_and_data(
-        self, batch_shape, m, outcome_transform=None, input_transform=None, **tkwargs
+        self,
+        batch_shape,
+        m,
+        outcome_transform=None,
+        input_transform=None,
+        extra_model_kwargs=None,
+        **tkwargs,
     ):
-        train_X, train_Y = _get_random_data(
-            batch_shape=batch_shape, num_outputs=m, **tkwargs
-        )
+        extra_model_kwargs = extra_model_kwargs or {}
+        train_X, train_Y = _get_random_data(batch_shape=batch_shape, m=m, **tkwargs)
         model_kwargs = {
             "train_X": train_X,
             "train_Y": train_Y,
             "outcome_transform": outcome_transform,
             "input_transform": input_transform,
         }
-        model = SingleTaskGP(**model_kwargs)
+        model = SingleTaskGP(**model_kwargs, **extra_model_kwargs)
         return model, model_kwargs
+
+    def _get_extra_model_kwargs(self):
+        return {
+            "mean_module": ZeroMean(),
+            "covar_module": RBFKernel(use_ard=False),
+            "likelihood": GaussianLikelihood(),
+        }
 
     def test_gp(self, double_only: bool = False):
         bounds = torch.tensor([[-1.0], [1.0]])
@@ -63,9 +76,7 @@ class TestSingleTaskGP(BotorchTestCase):
             tkwargs = {"device": self.device, "dtype": dtype}
             octf = Standardize(m=m, batch_shape=batch_shape) if use_octf else None
             intf = (
-                Normalize(
-                    d=1, bounds=bounds.to(**tkwargs), transform_on_preprocess=True
-                )
+                Normalize(d=1, bounds=bounds.to(**tkwargs), transform_on_train=True)
                 if use_intf
                 else None
             )
@@ -74,12 +85,14 @@ class TestSingleTaskGP(BotorchTestCase):
                 m=m,
                 outcome_transform=octf,
                 input_transform=intf,
-                **tkwargs
+                **tkwargs,
             )
             mll = ExactMarginalLogLikelihood(model.likelihood, model).to(**tkwargs)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=OptimizationWarning)
-                fit_gpytorch_model(mll, options={"maxiter": 1}, max_retries=1)
+                fit_gpytorch_mll(
+                    mll, optimizer_kwargs={"options": {"maxiter": 1}}, max_attempts=1
+                )
 
             # test init
             self.assertIsInstance(model.mean_module, ConstantMean)
@@ -126,11 +139,11 @@ class TestSingleTaskGP(BotorchTestCase):
                 pp_tf = model.posterior(X, observation_noise=True)
                 model.outcome_transform = tmp_tf
                 expected_var = tmp_tf.untransform_posterior(pp_tf).variance
-                self.assertTrue(torch.allclose(posterior_pred.variance, expected_var))
+                self.assertAllClose(posterior_pred.variance, expected_var)
             else:
                 pvar = posterior_pred.variance
                 pvar_exp = _get_pvar_expected(posterior, model, X, m)
-                self.assertTrue(torch.allclose(pvar, pvar_exp, rtol=1e-4, atol=1e-5))
+                self.assertAllClose(pvar, pvar_exp, rtol=1e-4, atol=1e-5)
 
             # test batch evaluation
             X = torch.rand(2, *batch_shape, 3, 1, **tkwargs)
@@ -150,11 +163,30 @@ class TestSingleTaskGP(BotorchTestCase):
                 pp_tf = model.posterior(X, observation_noise=True)
                 model.outcome_transform = tmp_tf
                 expected_var = tmp_tf.untransform_posterior(pp_tf).variance
-                self.assertTrue(torch.allclose(posterior_pred.variance, expected_var))
+                self.assertAllClose(posterior_pred.variance, expected_var)
             else:
                 pvar = posterior_pred.variance
                 pvar_exp = _get_pvar_expected(posterior, model, X, m)
-                self.assertTrue(torch.allclose(pvar, pvar_exp, rtol=1e-4, atol=1e-5))
+                self.assertAllClose(pvar, pvar_exp, rtol=1e-4, atol=1e-5)
+
+    def test_custom_init(self):
+        extra_model_kwargs = self._get_extra_model_kwargs()
+        for batch_shape, m, dtype in itertools.product(
+            (torch.Size(), torch.Size([2])),
+            (1, 2),
+            (torch.float, torch.double),
+        ):
+            tkwargs = {"device": self.device, "dtype": dtype}
+            model, model_kwargs = self._get_model_and_data(
+                batch_shape=batch_shape,
+                m=m,
+                extra_model_kwargs=extra_model_kwargs,
+                **tkwargs,
+            )
+            self.assertEqual(model.mean_module, extra_model_kwargs["mean_module"])
+            self.assertEqual(model.covar_module, extra_model_kwargs["covar_module"])
+            if "likelihood" in extra_model_kwargs:
+                self.assertEqual(model.likelihood, extra_model_kwargs["likelihood"])
 
     def test_condition_on_observations(self):
         for batch_shape, m, dtype, use_octf in itertools.product(
@@ -174,7 +206,7 @@ class TestSingleTaskGP(BotorchTestCase):
             fant_shape = torch.Size([2])
             # fantasize at different input points
             X_fant, Y_fant = _get_random_data(
-                fant_shape + batch_shape, m, n=3, **tkwargs
+                batch_shape=fant_shape + batch_shape, m=m, n=3, **tkwargs
             )
             c_kwargs = (
                 {"noise": torch.full_like(Y_fant, 0.01)}
@@ -251,8 +283,10 @@ class TestSingleTaskGP(BotorchTestCase):
                     )
                     self.assertTrue(
                         torch.allclose(
-                            posterior_same_inputs.mvn.covariance_matrix[:, 0, :, :],
-                            non_batch_posterior.mvn.covariance_matrix,
+                            posterior_same_inputs.distribution.covariance_matrix[
+                                :, 0, :, :
+                            ],
+                            non_batch_posterior.distribution.covariance_matrix,
                             atol=1e-3,
                         )
                     )
@@ -271,11 +305,28 @@ class TestSingleTaskGP(BotorchTestCase):
             )
             # fantasize
             X_f = torch.rand(torch.Size(batch_shape + torch.Size([4, 1])), **tkwargs)
-            sampler = SobolQMCNormalSampler(num_samples=3)
+            sampler = SobolQMCNormalSampler(sample_shape=torch.Size([3]))
             fm = model.fantasize(X=X_f, sampler=sampler)
             self.assertIsInstance(fm, model.__class__)
             fm = model.fantasize(X=X_f, sampler=sampler, observation_noise=False)
             self.assertIsInstance(fm, model.__class__)
+
+        # check that input transforms are applied to X.
+        tkwargs = {"device": self.device, "dtype": torch.float}
+        intf = Normalize(d=1, bounds=torch.tensor([[0], [10]], **tkwargs))
+        model, _ = self._get_model_and_data(
+            batch_shape=torch.Size(),
+            m=1,
+            input_transform=intf,
+            **tkwargs,
+        )
+        X_f = torch.rand(4, 1, **tkwargs)
+        fm = model.fantasize(
+            X_f, sampler=SobolQMCNormalSampler(sample_shape=torch.Size([3]))
+        )
+        self.assertTrue(
+            torch.allclose(fm.train_inputs[0][:, -4:], intf(X_f).expand(3, -1, -1))
+        )
 
     def test_subset_model(self):
         for batch_shape, dtype, use_octf in itertools.product(
@@ -298,6 +349,12 @@ class TestSingleTaskGP(BotorchTestCase):
                     p_sub.variance, p.variance[..., [0]], atol=1e-4, rtol=1e-4
                 )
             )
+            # test subsetting each of the outputs (follows a different code branch)
+            subset_all_model = model.subset_output([0, 1])
+            p_sub_all = subset_all_model.posterior(X)
+            self.assertAllClose(p_sub_all.mean, p.mean)
+            # subsetting should still return a copy
+            self.assertNotEqual(model, subset_all_model)
 
     def test_construct_inputs(self):
         for batch_shape, dtype in itertools.product(
@@ -305,23 +362,41 @@ class TestSingleTaskGP(BotorchTestCase):
         ):
             tkwargs = {"device": self.device, "dtype": dtype}
             model, model_kwargs = self._get_model_and_data(
-                batch_shape=batch_shape, m=2, **tkwargs
+                batch_shape=batch_shape, m=1, **tkwargs
             )
-            training_data = TrainingData(
-                X=model_kwargs["train_X"], Y=model_kwargs["train_Y"]
-            )
+            X = model_kwargs["train_X"]
+            Y = model_kwargs["train_Y"]
+            training_data = SupervisedDataset(X, Y)
             data_dict = model.construct_inputs(training_data)
-            self.assertTrue(torch.equal(data_dict["train_X"], model_kwargs["train_X"]))
-            self.assertTrue(torch.equal(data_dict["train_Y"], model_kwargs["train_Y"]))
+            self.assertTrue(X.equal(data_dict["train_X"]))
+            self.assertTrue(Y.equal(data_dict["train_Y"]))
+
+    def test_set_transformed_inputs(self):
+        # This intended to catch https://github.com/pytorch/botorch/issues/1078.
+        # More general testing of _set_transformed_inputs is done under ModelListGP.
+        X = torch.rand(5, 2)
+        Y = X**2
+        for tf_class in [Normalize, InputStandardize]:
+            intf = tf_class(d=2)
+            model = SingleTaskGP(X, Y, input_transform=intf)
+            mll = ExactMarginalLogLikelihood(model.likelihood, model)
+            fit_gpytorch_mll(mll, optimizer_kwargs={"options": {"maxiter": 2}})
+            tf_X = intf(X)
+            self.assertEqual(X.shape, tf_X.shape)
 
 
 class TestFixedNoiseGP(TestSingleTaskGP):
     def _get_model_and_data(
-        self, batch_shape, m, outcome_transform=None, input_transform=None, **tkwargs
+        self,
+        batch_shape,
+        m,
+        outcome_transform=None,
+        input_transform=None,
+        extra_model_kwargs=None,
+        **tkwargs,
     ):
-        train_X, train_Y = _get_random_data(
-            batch_shape=batch_shape, num_outputs=m, **tkwargs
-        )
+        extra_model_kwargs = extra_model_kwargs or {}
+        train_X, train_Y = _get_random_data(batch_shape=batch_shape, m=m, **tkwargs)
         model_kwargs = {
             "train_X": train_X,
             "train_Y": train_Y,
@@ -329,8 +404,14 @@ class TestFixedNoiseGP(TestSingleTaskGP):
             "input_transform": input_transform,
             "outcome_transform": outcome_transform,
         }
-        model = FixedNoiseGP(**model_kwargs)
+        model = FixedNoiseGP(**model_kwargs, **extra_model_kwargs)
         return model, model_kwargs
+
+    def _get_extra_model_kwargs(self):
+        return {
+            "mean_module": ZeroMean(),
+            "covar_module": RBFKernel(use_ard=False),
+        }
 
     def test_fixed_noise_likelihood(self):
         for batch_shape, m, dtype in itertools.product(
@@ -354,26 +435,16 @@ class TestFixedNoiseGP(TestSingleTaskGP):
         ):
             tkwargs = {"device": self.device, "dtype": dtype}
             model, model_kwargs = self._get_model_and_data(
-                batch_shape=batch_shape, m=2, **tkwargs
+                batch_shape=batch_shape, m=1, **tkwargs
             )
-            training_data = TrainingData(
-                X=model_kwargs["train_X"],
-                Y=model_kwargs["train_Y"],
-                Yvar=model_kwargs["train_Yvar"],
-            )
+            X = model_kwargs["train_X"]
+            Y = model_kwargs["train_Y"]
+            Yvar = model_kwargs["train_Yvar"]
+            training_data = FixedNoiseDataset(X, Y, Yvar)
             data_dict = model.construct_inputs(training_data)
-            self.assertTrue("train_Yvar" in data_dict)
-            self.assertTrue(torch.equal(data_dict["train_X"], model_kwargs["train_X"]))
-            self.assertTrue(torch.equal(data_dict["train_Y"], model_kwargs["train_Y"]))
-            self.assertTrue(
-                torch.equal(data_dict["train_Yvar"], model_kwargs["train_Yvar"])
-            )
-            # if Yvars is missing, then raise error
-            training_data = TrainingData(
-                X=model_kwargs["train_X"], Y=model_kwargs["train_Y"]
-            )
-            with self.assertRaises(ValueError):
-                model.construct_inputs(training_data)
+            self.assertTrue(X.equal(data_dict["train_X"]))
+            self.assertTrue(Y.equal(data_dict["train_Y"]))
+            self.assertTrue(Yvar.equal(data_dict["train_Yvar"]))
 
 
 class TestHeteroskedasticSingleTaskGP(TestSingleTaskGP):
@@ -381,10 +452,8 @@ class TestHeteroskedasticSingleTaskGP(TestSingleTaskGP):
         self, batch_shape, m, outcome_transform=None, input_transform=None, **tkwargs
     ):
         with manual_seed(0):
-            train_X, train_Y = _get_random_data(
-                batch_shape=batch_shape, num_outputs=m, **tkwargs
-            )
-        train_Yvar = (0.1 + 0.1 * torch.rand_like(train_Y)) ** 2
+            train_X, train_Y = _get_random_data(batch_shape=batch_shape, m=m, **tkwargs)
+            train_Yvar = (0.1 + 0.1 * torch.rand_like(train_Y)) ** 2
         model_kwargs = {
             "train_X": train_X,
             "train_Y": train_Y,
@@ -395,8 +464,22 @@ class TestHeteroskedasticSingleTaskGP(TestSingleTaskGP):
         model = HeteroskedasticSingleTaskGP(**model_kwargs)
         return model, model_kwargs
 
+    def test_custom_init(self) -> None:
+        """
+        This test exists because `TestHeteroskedasticSingleTaskGP` inherits from
+        `TestSingleTaskGP`, which has a `test_custom_init` method that isn't relevant
+        for `TestHeteroskedasticSingleTaskGP`.
+        """
+
     def test_gp(self):
         super().test_gp(double_only=True)
+
+    def test_fantasize(self) -> None:
+        """
+        This test exists because `TestHeteroskedasticSingleTaskGP` inherits from
+        `TestSingleTaskGP`, which has a `fantasize` method that isn't relevant
+        for `TestHeteroskedasticSingleTaskGP`.
+        """
 
     def test_heteroskedastic_likelihood(self):
         for batch_shape, m, dtype in itertools.product(
@@ -418,21 +501,20 @@ class TestHeteroskedasticSingleTaskGP(TestSingleTaskGP):
         with self.assertRaises(NotImplementedError):
             super().test_condition_on_observations()
 
-    def test_fantasize(self):
-        with self.assertRaises(NotImplementedError):
-            super().test_fantasize()
-
     def test_subset_model(self):
         with self.assertRaises(NotImplementedError):
             super().test_subset_model()
 
 
 def _get_pvar_expected(posterior, model, X, m):
+    X = model.transform_inputs(X)
     lh_kwargs = {}
     if isinstance(model.likelihood, FixedNoiseGaussianLikelihood):
         lh_kwargs["noise"] = model.likelihood.noise.mean().expand(X.shape[:-1])
     if m == 1:
-        return model.likelihood(posterior.mvn, X, **lh_kwargs).variance.unsqueeze(-1)
+        return model.likelihood(
+            posterior.distribution, X, **lh_kwargs
+        ).variance.unsqueeze(-1)
     X_, odi = add_output_dim(X=X, original_batch_shape=model._input_batch_shape)
     pvar_exp = model.likelihood(model(X_), X_, **lh_kwargs).variance
     return torch.stack([pvar_exp.select(dim=odi, index=i) for i in range(m)], dim=-1)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -17,12 +17,13 @@ import itertools
 import warnings
 from abc import ABC
 from copy import deepcopy
-from typing import Any, Iterator, List, Optional, Tuple, Union
+from typing import Any, Iterator, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
-from botorch.exceptions.errors import BotorchTensorDimensionError
+from botorch.acquisition.objective import PosteriorTransform
+from botorch.exceptions.errors import BotorchTensorDimensionError, InputDataError
 from botorch.exceptions.warnings import BotorchTensorDimensionWarning
-from botorch.models.model import Model
+from botorch.models.model import Model, ModelList
 from botorch.models.utils import (
     _make_X_full,
     add_output_dim,
@@ -30,11 +31,17 @@ from botorch.models.utils import (
     mod_batch_shape,
     multioutput_to_batch_mode_transform,
 )
+from botorch.posteriors.fully_bayesian import FullyBayesianPosterior
 from botorch.posteriors.gpytorch import GPyTorchPosterior
+from botorch.utils.transforms import is_fully_bayesian
 from gpytorch.distributions import MultitaskMultivariateNormal, MultivariateNormal
-from gpytorch.lazy import lazify
 from gpytorch.likelihoods.gaussian_likelihood import FixedNoiseGaussianLikelihood
 from torch import Tensor
+
+if TYPE_CHECKING:
+    from botorch.posteriors.posterior_list import PosteriorList  # pragma: no cover
+    from botorch.posteriors.transformed import TransformedPosterior  # pragma: no cover
+    from gpytorch.likelihoods import Likelihood  # pragma: no cover
 
 
 class GPyTorchModel(Model, ABC):
@@ -42,13 +49,17 @@ class GPyTorchModel(Model, ABC):
 
     The easiest way to use this is to subclass a model from a GPyTorch model
     class (e.g. an `ExactGP`) and this `GPyTorchModel`. See e.g. `SingleTaskGP`.
+
+    :meta private:
     """
+    likelihood: Likelihood
 
     @staticmethod
     def _validate_tensor_args(
         X: Tensor, Y: Tensor, Yvar: Optional[Tensor] = None, strict: bool = True
     ) -> None:
         r"""Checks that `Y` and `Yvar` have an explicit output dimension if strict.
+        Checks that the dtypes of the inputs match, and warns if using float.
 
         This also checks that `Yvar` has the same trailing dimensions as `Y`. Note
         we only infer that an explicit output dimension exists when `X` and `Y` have
@@ -96,6 +107,22 @@ class GPyTorchModel(Model, ABC):
                 f" Expected Yvar with shape: {Y.shape[-Yvar.dim() :]} (got"
                 f" {Yvar.shape})."
             )
+        # Check the dtypes.
+        if X.dtype != Y.dtype or (Yvar is not None and Y.dtype != Yvar.dtype):
+            raise InputDataError(
+                "Expected all inputs to share the same dtype. Got "
+                f"{X.dtype} for X, {Y.dtype} for Y, and "
+                f"{Yvar.dtype if Yvar is not None else None} for Yvar."
+            )
+        if X.dtype != torch.float64:
+            # NOTE: Not using a BotorchWarning since those get ignored.
+            warnings.warn(
+                f"The model inputs are of type {X.dtype}. It is strongly recommended "
+                "to use double precision in BoTorch, as this improves both "
+                "precision and stability and can help avoid numerical errors. "
+                "See https://github.com/pytorch/botorch/discussions/1444",
+                UserWarning,
+            )
 
     @property
     def batch_shape(self) -> torch.Size:
@@ -114,9 +141,17 @@ class GPyTorchModel(Model, ABC):
         r"""The number of outputs of the model."""
         return self._num_outputs
 
+    # pyre-fixme[14]: Inconsistent override.
+    # `botorch.models.gpytorch.GPyTorchModel.posterior` overrides method defined
+    # in `Model` inconsistently. Could not find parameter `output_indices` in
+    # overriding signature.
     def posterior(
-        self, X: Tensor, observation_noise: Union[bool, Tensor] = False, **kwargs: Any
-    ) -> GPyTorchPosterior:
+        self,
+        X: Tensor,
+        observation_noise: Union[bool, Tensor] = False,
+        posterior_transform: Optional[PosteriorTransform] = None,
+        **kwargs: Any,
+    ) -> Union[GPyTorchPosterior, TransformedPosterior]:
         r"""Computes the posterior over model outputs at the provided points.
 
         Args:
@@ -126,6 +161,7 @@ class GPyTorchModel(Model, ABC):
             observation_noise: If True, add the observation noise from the
                 likelihood to the posterior. If a Tensor, use it directly as the
                 observation noise (must be of shape `(batch_shape) x q`).
+            posterior_transform: An optional PosteriorTransform.
 
         Returns:
             A `GPyTorchPosterior` object, representing a batch of `b` joint
@@ -133,10 +169,13 @@ class GPyTorchModel(Model, ABC):
             specified.
         """
         self.eval()  # make sure model is in eval mode
+        # input transforms are applied at `posterior` in `eval` mode, and at
+        # `model.forward()` at the training time
+        X = self.transform_inputs(X)
         with gpt_posterior_settings():
             mvn = self(X)
             if observation_noise is not False:
-                if torch.is_tensor(observation_noise):
+                if isinstance(observation_noise, torch.Tensor):
                     # TODO: Make sure observation noise is transformed correctly
                     self._validate_tensor_args(X=X, Y=observation_noise)
                     if observation_noise.size(-1) == 1:
@@ -144,9 +183,11 @@ class GPyTorchModel(Model, ABC):
                     mvn = self.likelihood(mvn, X, noise=observation_noise)
                 else:
                     mvn = self.likelihood(mvn, X)
-        posterior = GPyTorchPosterior(mvn=mvn)
+        posterior = GPyTorchPosterior(distribution=mvn)
         if hasattr(self, "outcome_transform"):
             posterior = self.outcome_transform.untransform_posterior(posterior)
+        if posterior_transform is not None:
+            return posterior_transform(posterior)
         return posterior
 
     def condition_on_observations(self, X: Tensor, Y: Tensor, **kwargs: Any) -> Model:
@@ -196,11 +237,15 @@ class GPyTorchModel(Model, ABC):
         return self.get_fantasy_model(inputs=X, targets=Y, **kwargs)
 
 
+# pyre-fixme[13]: uninitialized attributes _num_outputs, _input_batch_shape,
+# _aug_batch_shape
 class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
     r"""Base class for batched multi-output GPyTorch models with independent outputs.
 
     This model should be used when the same training data is used for all outputs.
     Outputs are modeled independently by using a different batch for each output.
+
+    :meta private:
     """
 
     _num_outputs: int
@@ -293,8 +338,9 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
         X: Tensor,
         output_indices: Optional[List[int]] = None,
         observation_noise: Union[bool, Tensor] = False,
+        posterior_transform: Optional[PosteriorTransform] = None,
         **kwargs: Any,
-    ) -> GPyTorchPosterior:
+    ) -> Union[GPyTorchPosterior, TransformedPosterior]:
         r"""Computes the posterior over model outputs at the provided points.
 
         Args:
@@ -309,6 +355,7 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
             observation_noise: If True, add the observation noise from the
                 likelihood to the posterior. If a Tensor, use it directly as the
                 observation noise (must be of shape `(batch_shape) x q x m`).
+            posterior_transform: An optional PosteriorTransform.
 
         Returns:
             A `GPyTorchPosterior` object, representing `batch_shape` joint
@@ -316,6 +363,9 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
             `output_indices` each. Includes observation noise if specified.
         """
         self.eval()  # make sure model is in eval mode
+        # input transforms are applied at `posterior` in `eval` mode, and at
+        # `model.forward()` at the training time
+        X = self.transform_inputs(X)
         with gpt_posterior_settings():
             # insert a dimension for the output dimension
             if self._num_outputs > 1:
@@ -337,20 +387,22 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
                     mvn = self.likelihood(mvn, X)
             if self._num_outputs > 1:
                 mean_x = mvn.mean
-                covar_x = mvn.covariance_matrix
+                covar_x = mvn.lazy_covariance_matrix
                 output_indices = output_indices or range(self._num_outputs)
                 mvns = [
                     MultivariateNormal(
                         mean_x.select(dim=output_dim_idx, index=t),
-                        lazify(covar_x.select(dim=output_dim_idx, index=t)),
+                        covar_x[(slice(None),) * output_dim_idx + (t,)],
                     )
                     for t in output_indices
                 ]
                 mvn = MultitaskMultivariateNormal.from_independent_mvns(mvns=mvns)
 
-        posterior = GPyTorchPosterior(mvn=mvn)
+        posterior = GPyTorchPosterior(distribution=mvn)
         if hasattr(self, "outcome_transform"):
             posterior = self.outcome_transform.untransform_posterior(posterior)
+        if posterior_transform is not None:
+            return posterior_transform(posterior)
         return posterior
 
     def condition_on_observations(
@@ -432,6 +484,11 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
 
         m = len(idcs)
         new_model = deepcopy(self)
+
+        subset_everything = self.num_outputs == m and idcs == list(range(m))
+        if subset_everything:
+            return new_model
+
         tidxr = torch.tensor(idcs, device=new_model.train_targets.device)
         idxr = tidxr if m > 1 else idcs[0]
         new_tail_bs = torch.Size([m]) if m > 1 else torch.Size()
@@ -466,11 +523,13 @@ class BatchedMultiOutputGPyTorchModel(GPyTorchModel):
         return new_model
 
 
-class ModelListGPyTorchModel(GPyTorchModel, ABC):
+class ModelListGPyTorchModel(GPyTorchModel, ModelList, ABC):
     r"""Abstract base class for models based on multi-output GPyTorch models.
 
     This is meant to be used with a gpytorch ModelList wrapper for independent
     evaluation of submodels.
+
+    :meta private:
     """
 
     @property
@@ -483,16 +542,29 @@ class ModelListGPyTorchModel(GPyTorchModel, ABC):
         to the `posterior` method returns a Posterior object over an output of
         shape `broadcast(test_batch_shape, model.batch_shape) x q x m`.
         """
-        # TODO: Either check that batch shapes match across models, or broadcast them
-        raise NotImplementedError
+        batch_shapes = {m.batch_shape for m in self.models}
+        if len(batch_shapes) > 1:
+            msg = (
+                f"Component models of {self.__class__.__name__} have different "
+                "batch shapes"
+            )
+            try:
+                broadcast_shape = torch.broadcast_shapes(*batch_shapes)
+                warnings.warn(msg + ". Broadcasting batch shapes.")
+                return broadcast_shape
+            except RuntimeError:
+                raise NotImplementedError(msg + " that are not broadcastble.")
+        return next(iter(batch_shapes))
 
+    # pyre-fixme[15]: Inconsistent override in return types
     def posterior(
         self,
         X: Tensor,
         output_indices: Optional[List[int]] = None,
         observation_noise: Union[bool, Tensor] = False,
+        posterior_transform: Optional[PosteriorTransform] = None,
         **kwargs: Any,
-    ) -> GPyTorchPosterior:
+    ) -> Union[GPyTorchPosterior, PosteriorList]:
         r"""Computes the posterior over model outputs at the provided points.
 
         Args:
@@ -509,78 +581,114 @@ class ModelListGPyTorchModel(GPyTorchModel, ABC):
                 `(batch_shape) x q x m`, use it directly as the observation
                 noise (with `observation_noise[...,i]` added to the posterior
                 of the `i`-th model).
+            posterior_transform: An optional PosteriorTransform.
 
         Returns:
-            A `GPyTorchPosterior` object, representing `batch_shape` joint
-            distributions over `q` points and the outputs selected by
-            `output_indices` each. Includes measurement noise if
-            `observation_noise` is specified.
+            - If no `posterior_transform` is provided and the component models have no
+                `outcome_transform`, or if the component models only use linear outcome
+                transforms like `Standardize` (i.e. not `Log`), returns a
+                `GPyTorchPosterior` or `FullyBayesianPosterior` object,
+                representing `batch_shape` joint distributions over `q` points
+                and the outputs selected by `output_indices` each. Includes
+                measurement noise if `observation_noise` is specified.
+            - If no `posterior_transform` is provided and component models have
+                nonlinear transforms like `Log`, returns a `PosteriorList` with
+                sub-posteriors of type `TransformedPosterior`
+            - If `posterior_transform` is provided, that posterior transform will be
+               applied and will determine the return type. This could potentially be
+               any subclass of `Posterior`, but common choices give a
+               `GPyTorchPosterior`.
         """
+
+        # Nonlinear transforms untransform to a `TransformedPosterior`,
+        # which can't be made into a `GPyTorchPosterior`
+        returns_untransformed = any(
+            hasattr(mod, "outcome_transform") and (not mod.outcome_transform._is_linear)
+            for mod in self.models
+        )
+        if returns_untransformed:
+            return ModelList.posterior(
+                self,
+                X,
+                output_indices,
+                observation_noise,
+                posterior_transform,
+                **kwargs,
+            )
+
         self.eval()  # make sure model is in eval mode
+        # input transforms are applied at `posterior` in `eval` mode, and at
+        # `model.forward()` at the training time
+        transformed_X = self.transform_inputs(X)
         mvn_gen: Iterator
         with gpt_posterior_settings():
             # only compute what's necessary
             if output_indices is not None:
-                mvns = [self.forward_i(i, X) for i in output_indices]
+                mvns = [self.models[i](transformed_X[i]) for i in output_indices]
                 if observation_noise is not False:
-                    if torch.is_tensor(observation_noise):
+                    if isinstance(observation_noise, Tensor):
                         lh_kwargs = [
                             {"noise": observation_noise[..., i]}
                             for i, lh in enumerate(self.likelihood.likelihoods)
                         ]
                     else:
                         lh_kwargs = [
-                            {"noise": lh.noise.mean().expand(X.shape[:-1])}
+                            {"noise": lh.noise.mean().expand(t_X.shape[:-1])}
                             if isinstance(lh, FixedNoiseGaussianLikelihood)
                             else {}
-                            for lh in self.likelihood.likelihoods
+                            for t_X, lh in zip(
+                                transformed_X, self.likelihood.likelihoods
+                            )
                         ]
                     mvns = [
-                        self.likelihood_i(i, mvn, X, **lkws)
+                        self.likelihood_i(i, mvn, transformed_X[i], **lkws)
                         for i, mvn, lkws in zip(output_indices, mvns, lh_kwargs)
                     ]
                 mvn_gen = zip(output_indices, mvns)
             else:
-                mvns = self(*[X for _ in range(self.num_outputs)])
+                mvns = self(*transformed_X)
                 if observation_noise is not False:
+                    mvnX = [(mvn, transformed_X[i]) for i, mvn in enumerate(mvns)]
                     if torch.is_tensor(observation_noise):
-                        mvns = self.likelihood(
-                            *[(mvn, X) for mvn in mvns], noise=observation_noise
-                        )
+                        mvns = self.likelihood(*mvnX, noise=observation_noise)
                     else:
-                        mvns = self.likelihood(*[(mvn, X) for mvn in mvns])
+                        mvns = self.likelihood(*mvnX)
                 mvn_gen = enumerate(mvns)
         # apply output transforms of individual models if present
         mvns = []
         for i, mvn in mvn_gen:
-            try:
+            if hasattr(self.models[i], "outcome_transform"):
                 oct = self.models[i].outcome_transform
-                tf_mvn = oct.untransform_posterior(GPyTorchPosterior(mvn)).mvn
-            except AttributeError:
+                tf_mvn = oct.untransform_posterior(GPyTorchPosterior(mvn)).distribution
+            else:
                 tf_mvn = mvn
             mvns.append(tf_mvn)
-        # return result as a GPyTorchPosteriors
-        if len(mvns) == 1:
-            return GPyTorchPosterior(mvn=mvns[0])
-        else:
-            return GPyTorchPosterior(
-                mvn=MultitaskMultivariateNormal.from_independent_mvns(mvns=mvns)
-            )
-
-    def condition_on_observations(
-        self, X: Tensor, Y: Tensor, **kwargs: Any
-    ) -> ModelListGPyTorchModel:
-        class_name = self.__class__.__name__
-        raise NotImplementedError(
-            f"`condition_on_observations` not implemented in {class_name}"
+        # return result as a GPyTorchPosteriors/FullyBayesianPosterior
+        mvn = (
+            mvns[0]
+            if len(mvns) == 1
+            else MultitaskMultivariateNormal.from_independent_mvns(mvns=mvns)
         )
+        if any(is_fully_bayesian(m) for m in self.models):
+            # mixing fully Bayesian and other GP models is currently not supported
+            posterior = FullyBayesianPosterior(distribution=mvn)
+        else:
+            posterior = GPyTorchPosterior(distribution=mvn)
+        if posterior_transform is not None:
+            return posterior_transform(posterior)
+        return posterior
+
+    def condition_on_observations(self, X: Tensor, Y: Tensor, **kwargs: Any) -> Model:
+        raise NotImplementedError()
 
 
 class MultiTaskGPyTorchModel(GPyTorchModel, ABC):
-    r"""Abstract base class for multi-task models baed on GPyTorch models.
+    r"""Abstract base class for multi-task models based on GPyTorch models.
 
     This class provides the `posterior` method to models that implement a
     "long-format" multi-task GP in the style of `MultiTaskGP`.
+
+    :meta private:
     """
 
     def posterior(
@@ -588,8 +696,9 @@ class MultiTaskGPyTorchModel(GPyTorchModel, ABC):
         X: Tensor,
         output_indices: Optional[List[int]] = None,
         observation_noise: Union[bool, Tensor] = False,
+        posterior_transform: Optional[PosteriorTransform] = None,
         **kwargs: Any,
-    ) -> GPyTorchPosterior:
+    ) -> Union[GPyTorchPosterior, TransformedPosterior]:
         r"""Computes the posterior over model outputs at the provided points.
 
         Args:
@@ -604,6 +713,7 @@ class MultiTaskGPyTorchModel(GPyTorchModel, ABC):
             observation_noise: If True, add observation noise from the respective
                 likelihoods. If a Tensor, specifies the observation noise levels
                 to add.
+            posterior_transform: An optional PosteriorTransform.
 
         Returns:
             A `GPyTorchPosterior` object, representing `batch_shape` joint
@@ -617,15 +727,14 @@ class MultiTaskGPyTorchModel(GPyTorchModel, ABC):
         if any(i not in self._output_tasks for i in output_indices):
             raise ValueError("Too many output indices")
         cls_name = self.__class__.__name__
-        if hasattr(self, "outcome_transform"):
-            raise NotImplementedError(
-                f"Outcome transforms currently not supported by {cls_name}"
-            )
 
         # construct evaluation X
         X_full = _make_X_full(X=X, output_indices=output_indices, tf=self._task_feature)
 
         self.eval()  # make sure model is in eval mode
+        # input transforms are applied at `posterior` in `eval` mode, and at
+        # `model.forward()` at the training time
+        X_full = self.transform_inputs(X_full)
         with gpt_posterior_settings():
             mvn = self(X_full)
             if observation_noise is not False:
@@ -634,11 +743,19 @@ class MultiTaskGPyTorchModel(GPyTorchModel, ABC):
                 )
         # If single-output, return the posterior of a single-output model
         if num_outputs == 1:
-            return GPyTorchPosterior(mvn=mvn)
-        # Otherwise, make a MultitaskMultivariateNormal out of this
-        mtmvn = MultitaskMultivariateNormal(
-            mean=mvn.mean.view(*X.shape[:-2], num_outputs, -1).transpose(-1, -2),
-            covariance_matrix=mvn.lazy_covariance_matrix,
-            interleaved=False,
-        )
-        return GPyTorchPosterior(mvn=mtmvn)
+            posterior = GPyTorchPosterior(distribution=mvn)
+        else:
+            # Otherwise, make a MultitaskMultivariateNormal out of this
+            mtmvn = MultitaskMultivariateNormal(
+                mean=mvn.mean.view(*mvn.mean.shape[:-1], num_outputs, -1).transpose(
+                    -1, -2
+                ),
+                covariance_matrix=mvn.lazy_covariance_matrix,
+                interleaved=False,
+            )
+            posterior = GPyTorchPosterior(distribution=mtmvn)
+        if hasattr(self, "outcome_transform"):
+            posterior = self.outcome_transform.untransform_posterior(posterior)
+        if posterior_transform is not None:
+            return posterior_transform(posterior)
+        return posterior

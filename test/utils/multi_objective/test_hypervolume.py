@@ -1,5 +1,5 @@
 #! /usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -7,10 +7,9 @@
 from __future__ import annotations
 
 import torch
-from botorch.exceptions.errors import BotorchTensorDimensionError
-from botorch.utils.multi_objective.hypervolume import Hypervolume
+from botorch.exceptions.errors import BotorchError, BotorchTensorDimensionError
+from botorch.utils.multi_objective.hypervolume import Hypervolume, infer_reference_point
 from botorch.utils.testing import BotorchTestCase
-
 
 EPS = 1e-4
 
@@ -126,7 +125,7 @@ class TestHypervolume(BotorchTestCase):
                     [0.0, 0.0, -1.0, 0.0],
                     [0.0, 0.0, 0.0, -1.0],
                 ],
-                **tkwargs
+                **tkwargs,
             )
             volume = hv.compute(pareto_Y=pareto_Y)
             self.assertTrue(abs(volume - 23.15) < EPS)
@@ -138,3 +137,166 @@ class TestHypervolume(BotorchTestCase):
             pareto_Y = torch.tensor(pareto_Y_5d, **tkwargs)
             volume = hv.compute(pareto_Y)
             self.assertTrue(abs(volume - 0.42127855991587) < EPS)
+
+
+class TestGetReferencePoint(BotorchTestCase):
+    def test_infer_reference_point(self):
+        tkwargs = {"device": self.device}
+        for dtype in (torch.float, torch.double):
+            tkwargs["dtype"] = dtype
+            Y = torch.tensor(
+                [
+                    [-13.9599, -24.0326],
+                    [-19.6755, -11.4721],
+                    [-18.7742, -11.9193],
+                    [-16.6614, -12.3283],
+                    [-17.7663, -11.9941],
+                    [-17.4367, -12.2948],
+                    [-19.4244, -11.9158],
+                    [-14.0806, -22.0004],
+                ],
+                **tkwargs,
+            )
+
+            # test empty pareto_Y and no max_ref_point
+            with self.assertRaises(BotorchError):
+                infer_reference_point(pareto_Y=Y[:0])
+
+            # test max_ref_point does not change when there exists a better Y point
+            max_ref_point = Y.min(dim=0).values
+            ref_point = infer_reference_point(max_ref_point=max_ref_point, pareto_Y=Y)
+            self.assertTrue(torch.equal(max_ref_point, ref_point))
+            # test scale_max_ref_point
+            ref_point = infer_reference_point(
+                max_ref_point=max_ref_point, pareto_Y=Y, scale_max_ref_point=True
+            )
+            better_than_ref = (Y > max_ref_point).all(dim=-1)
+            Y_better_than_ref = Y[better_than_ref]
+            ideal_better_than_ref = Y_better_than_ref.max(dim=0).values
+            self.assertTrue(
+                torch.equal(
+                    max_ref_point - 0.1 * (ideal_better_than_ref - max_ref_point),
+                    ref_point,
+                )
+            )
+            # test case when there does not exist a better Y point
+            max_ref_point = torch.tensor([-2.2, -2.3], **tkwargs)
+            ref_point = infer_reference_point(max_ref_point=max_ref_point, pareto_Y=Y)
+            self.assertTrue((ref_point < Y).all(dim=-1).any())
+            nadir = Y.min(dim=0).values
+            ideal = Y.max(dim=0).values
+            expected_ref_point = nadir - 0.1 * (ideal - nadir)
+            self.assertAllClose(ref_point, expected_ref_point)
+            # test with scale
+            expected_ref_point = nadir - 0.2 * (ideal - nadir)
+            ref_point = infer_reference_point(
+                max_ref_point=max_ref_point, pareto_Y=Y, scale=0.2
+            )
+            self.assertAllClose(ref_point, expected_ref_point)
+
+            # test case when one objective is better than max_ref_point, and
+            # one objective is worse
+            max_ref_point = torch.tensor([-2.2, -12.1], **tkwargs)
+            expected_ref_point = nadir - 0.1 * (ideal - nadir)
+            expected_ref_point = torch.min(expected_ref_point, max_ref_point)
+            ref_point = infer_reference_point(max_ref_point=max_ref_point, pareto_Y=Y)
+            self.assertTrue(torch.equal(expected_ref_point, ref_point))
+            # test case when one objective is better than max_ref_point, and
+            # one objective is worse with scale_max_ref_point
+            ref_point = infer_reference_point(
+                max_ref_point=max_ref_point, pareto_Y=Y, scale_max_ref_point=True
+            )
+            nadir2 = torch.min(nadir, max_ref_point)
+            expected_ref_point = nadir2 - 0.1 * (ideal - nadir2)
+            self.assertTrue(torch.equal(expected_ref_point, ref_point))
+
+            # test case when size of pareto_Y is 0
+            ref_point = infer_reference_point(
+                max_ref_point=max_ref_point, pareto_Y=Y[:0]
+            )
+            self.assertTrue(torch.equal(max_ref_point, ref_point))
+            # test case when size of pareto_Y is 0 with scale_max_ref_point
+            ref_point = infer_reference_point(
+                max_ref_point=max_ref_point,
+                pareto_Y=Y[:0],
+                scale_max_ref_point=True,
+                scale=0.2,
+            )
+            self.assertTrue(
+                torch.equal(max_ref_point - 0.2 * max_ref_point.abs(), ref_point)
+            )
+            # test case when size of pareto_Y is 1
+            ref_point = infer_reference_point(
+                max_ref_point=max_ref_point, pareto_Y=Y[:1]
+            )
+            expected_ref_point = Y[0] - 0.1 * Y[0].abs()
+            self.assertTrue(torch.equal(expected_ref_point, ref_point))
+            # test case when size of pareto_Y is 1 with scale parameter
+            ref_point = infer_reference_point(
+                max_ref_point=max_ref_point, pareto_Y=Y[:1], scale=0.2
+            )
+            expected_ref_point = Y[0] - 0.2 * Y[0].abs()
+            self.assertTrue(torch.equal(expected_ref_point, ref_point))
+
+            # test no max_ref_point specified
+            expected_ref_point = nadir - 0.2 * (ideal - nadir)
+            ref_point = infer_reference_point(pareto_Y=Y, scale=0.2)
+            self.assertAllClose(ref_point, expected_ref_point)
+            ref_point = infer_reference_point(pareto_Y=Y)
+            expected_ref_point = nadir - 0.1 * (ideal - nadir)
+            self.assertAllClose(ref_point, expected_ref_point)
+
+            # Test all NaN max_ref_point.
+            ref_point = infer_reference_point(
+                pareto_Y=Y,
+                max_ref_point=torch.tensor([float("nan"), float("nan")], **tkwargs),
+            )
+            self.assertAllClose(ref_point, expected_ref_point)
+            # Test partial NaN, partial worse than nadir.
+            expected_ref_point = nadir.clone()
+            expected_ref_point[1] = -1e5
+            ref_point = infer_reference_point(
+                pareto_Y=Y,
+                max_ref_point=torch.tensor([float("nan"), -1e5], **tkwargs),
+                scale=0.0,
+            )
+            self.assertAllClose(ref_point, expected_ref_point)
+            # Test partial NaN, partial better than nadir.
+            expected_ref_point = nadir
+            ref_point = infer_reference_point(
+                pareto_Y=Y,
+                max_ref_point=torch.tensor([float("nan"), 1e5], **tkwargs),
+                scale=0.0,
+            )
+            self.assertAllClose(ref_point, expected_ref_point)
+            # Test partial NaN, partial worse than nadir with scale_max_ref_point.
+            expected_ref_point[1] = -1e5
+            expected_ref_point = expected_ref_point - 0.2 * (ideal - expected_ref_point)
+            ref_point = infer_reference_point(
+                pareto_Y=Y,
+                max_ref_point=torch.tensor([float("nan"), -1e5], **tkwargs),
+                scale=0.2,
+                scale_max_ref_point=True,
+            )
+            self.assertAllClose(ref_point, expected_ref_point)
+            # Test with single point in Pareto_Y, worse than ref point.
+            ref_point = infer_reference_point(
+                pareto_Y=Y[:1],
+                max_ref_point=torch.tensor([float("nan"), 1e5], **tkwargs),
+            )
+            expected_ref_point = Y[0] - 0.1 * Y[0].abs()
+            self.assertTrue(torch.equal(expected_ref_point, ref_point))
+            # Test with single point in Pareto_Y, better than ref point.
+            ref_point = infer_reference_point(
+                pareto_Y=Y[:1],
+                max_ref_point=torch.tensor([float("nan"), -1e5], **tkwargs),
+                scale_max_ref_point=True,
+            )
+            expected_ref_point[1] = -1e5 - 0.1 * Y[0, 1].abs()
+            self.assertTrue(torch.equal(expected_ref_point, ref_point))
+            # Empty pareto_Y with nan ref point.
+            with self.assertRaisesRegex(BotorchError, "ref point includes NaN"):
+                ref_point = infer_reference_point(
+                    pareto_Y=Y[:0],
+                    max_ref_point=torch.tensor([float("nan"), -1e5], **tkwargs),
+                )

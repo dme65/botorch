@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -7,12 +7,16 @@
 
 import torch
 from botorch.acquisition import (
-    qMultiStepLookahead,
-    qExpectedImprovement,
     ExpectedImprovement,
+    qExpectedImprovement,
+    qMultiStepLookahead,
 )
 from botorch.acquisition.multi_step_lookahead import make_best_f, warmstart_multistep
-from botorch.acquisition.objective import IdentityMCObjective, ScalarizedObjective
+from botorch.acquisition.objective import (
+    IdentityMCObjective,
+    ScalarizedObjective,
+    ScalarizedPosteriorTransform,
+)
 from botorch.exceptions.errors import UnsupportedError
 from botorch.models import SingleTaskGP
 from botorch.sampling import SobolQMCNormalSampler
@@ -57,9 +61,7 @@ class TestMultiStepLookahead(BotorchTestCase):
 
             # construct using samplers
             samplers = [
-                SobolQMCNormalSampler(
-                    num_samples=nf, resample=False, collapse_batch_dims=True
-                )
+                SobolQMCNormalSampler(sample_shape=torch.Size([nf]))
                 for nf in num_fantasies
             ]
             qMS = qMultiStepLookahead(
@@ -113,20 +115,33 @@ class TestMultiStepLookahead(BotorchTestCase):
                     num_fantasies=num_fantasies,
                     inner_mc_samples=[2] * 4,
                 )
-            # MCAcquisitionFunction and non MCAcquisitionObjective
-            with self.assertRaises(UnsupportedError):
-                qMultiStepLookahead(
+            # AnalyticAcquisitionFunction with scalarized obj (deprecated)
+            with self.assertWarns(DeprecationWarning):
+                acqf = qMultiStepLookahead(
                     model=model,
-                    objective=ScalarizedObjective(
-                        weights=torch.tensor([1.0], device=self.device, dtype=dtype)
-                    ),
-                    batch_sizes=[2, 2, 2],
-                    valfunc_cls=[qExpectedImprovement] * 4,
+                    objective=ScalarizedObjective(weights=torch.ones(1)),
+                    batch_sizes=q_batch_sizes,
+                    valfunc_cls=[ExpectedImprovement] * 4,
                     valfunc_argfacs=[make_best_f] * 4,
                     num_fantasies=num_fantasies,
-                    inner_mc_samples=[2] * 4,
                 )
-
+            self.assertIsNone(acqf.objective)
+            self.assertIsInstance(
+                acqf.posterior_transform, ScalarizedPosteriorTransform
+            )
+            # Both scalarized obj and scalarized post_tf
+            with self.assertRaises(RuntimeError):
+                qMultiStepLookahead(
+                    model=model,
+                    objective=ScalarizedObjective(weights=torch.ones(1)),
+                    posterior_transform=ScalarizedPosteriorTransform(
+                        weights=torch.ones(1)
+                    ),
+                    batch_sizes=q_batch_sizes,
+                    valfunc_cls=[ExpectedImprovement] * 4,
+                    valfunc_argfacs=[make_best_f] * 4,
+                    num_fantasies=num_fantasies,
+                )
             # test warmstarting
             qMS = qMultiStepLookahead(
                 model=model,
@@ -211,7 +226,9 @@ class TestMultiStepLookahead(BotorchTestCase):
             )
             result = qMS(eval_X)
             self.assertEqual(result.shape, torch.Size(t_batch_size))
-            self.assertEqual(qMS.samplers[0].batch_range, (-3, -2))
+            self.assertEqual(
+                qMS.samplers[0]._get_batch_range(model.posterior(eval_X)), (-3, -2)
+            )
 
             # get induced fantasy model, without collapse_fantasy_base_samples
             fant_model = qMS.get_induced_fantasy_model(eval_X)
@@ -244,9 +261,7 @@ class TestMultiStepLookahead(BotorchTestCase):
 
             # add dummy base_weights to samplers
             samplers = [
-                SobolQMCNormalSampler(
-                    num_samples=nf, resample=False, collapse_batch_dims=True
-                )
+                SobolQMCNormalSampler(sample_shape=torch.Size([nf]))
                 for nf in num_fantasies
             ]
             for s in samplers:

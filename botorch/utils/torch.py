@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -54,6 +54,11 @@ class BufferDict(Module):
     """
 
     def __init__(self, buffers=None):
+        r"""
+        Args:
+            buffers: A mapping (dictionary) from string to :class:`~torch.Tensor`, or
+                an iterable of key-value pairs of type (string, :class:`~torch.Tensor`).
+        """
         super(BufferDict, self).__init__()
         if buffers is not None:
             self.update(buffers)

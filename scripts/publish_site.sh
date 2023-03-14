@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -10,7 +10,7 @@ usage() {
   echo "Build and push updated BoTorch site. Will either update latest or bump stable version."
   echo ""
   echo "  -d           Use Docusaurus bot GitHub credentials. If not specified, will use default GitHub credentials."
-  echo "  -v=VERSION   Build site for new library version. If not specified, will update master."
+  echo "  -v=VERSION   Build site for new library version. If not specified, will update latest version."
   echo ""
   exit 1
 }
@@ -35,6 +35,10 @@ while getopts 'dhv:' option; do
   esac
 done
 
+if [[ $VERSION != false ]]; then
+  # Strip any leading "v" in the VERSION string
+  VERSION=$(echo "$VERSION"  | sed "s/v//");
+fi
 
 # Function to get absolute filename
 fullpath() {
@@ -54,12 +58,12 @@ if [[ $DOCUSAURUS_BOT == true ]]; then
   git config --global user.name "BoTorch website deployment script"
   echo "machine github.com login docusaurus-bot password ${DOCUSAURUS_PUBLISH_TOKEN}" > ~/.netrc
 
-  # Clone both master & gh-pages branches
-  git clone https://docusaurus-bot@github.com/pytorch/botorch.git botorch-master
+  # Clone both main & gh-pages branches
+  git clone https://docusaurus-bot@github.com/pytorch/botorch.git botorch-main
   git clone --branch gh-pages https://docusaurus-bot@github.com/pytorch/botorch.git botorch-gh-pages
 else
-  git clone git@github.com:pytorch/botorch.git botorch-master
-  git clone --branch gh-pages git@github.com:pytorch/botorch.git botorch-gh-pages
+  git clone https://github.com/pytorch/botorch.git botorch-main
+  git clone --branch gh-pages https://github.com/pytorch/botorch.git botorch-gh-pages
 fi
 
 # A few notes about the script below:
@@ -91,11 +95,11 @@ fi
 #   the site or the latest version. Instead, we determine this at runtime.
 #   We use what's on gh-pages in the versions subdirectory as the
 #   source of truth for available versions and use the latest tag on
-#   the master branch as the source of truth for the latest version.
+#   the main branch as the source of truth for the latest version.
 
 if [[ $VERSION == false ]]; then
   echo "-----------------------------------------"
-  echo "Updating latest (master) version of site "
+  echo "Updating latest (main) version of site "
   echo "-----------------------------------------"
 
   # Populate _versions.json from existing versions; this is used
@@ -105,12 +109,12 @@ if [[ $VERSION == false ]]; then
   CMD="import os, json; "
   CMD+="vs = [v for v in os.listdir('botorch-gh-pages/v') if v != 'latest' and not v.startswith('.')]; "
   CMD+="print(json.dumps(vs))"
-  python3 -c "$CMD" > botorch-master/website/_versions.json
+  python3 -c "$CMD" > botorch-main/website/_versions.json
 
   # Move versions.js to website subdirectory.
   # This is the page you see when click on version in navbar.
-  cp botorch-master/scripts/versions.js botorch-master/website/pages/en/versions.js
-  cd botorch-master/website || exit
+  cp botorch-main/scripts/versions.js botorch-main/website/pages/en/versions.js
+  cd botorch-main/website || exit
 
   # Replace baseUrl (set to /v/latest/) & disable Algolia
   CONFIG_FILE=$(fullpath "siteConfig.js")
@@ -129,7 +133,7 @@ if [[ $VERSION == false ]]; then
   cd "${WORK_DIR}" || exit
   cp botorch-gh-pages/v/latest/versions.html versions.html
   rm -rf botorch-gh-pages/v/latest
-  mv botorch-master/website/build/botorch botorch-gh-pages/v/latest
+  mv botorch-main/website/build/botorch botorch-gh-pages/v/latest
   # versions.html goes both in top-level and under en/ (default language)
   cp versions.html botorch-gh-pages/v/latest/versions.html
   cp versions.html botorch-gh-pages/v/latest/en/versions.html
@@ -145,8 +149,8 @@ else
   echo "Building new version ($VERSION) of site "
   echo "-----------------------------------------"
 
-  # Checkout master branch with specified tag
-  cd botorch-master || exit
+  # Checkout main branch with specified tag
+  cd botorch-main || exit
   git fetch --tags
   git checkout "v${VERSION}"
 
@@ -177,15 +181,15 @@ else
   # Move built site to new folder (new-site) & carry over old versions
   # from existing gh-pages
   cd "${WORK_DIR}" || exit
-  rm -rf botorch-master/website/build/botorch/docs/next  # don't need this
-  mv botorch-master/website/build/botorch new-site
+  rm -rf botorch-main/website/build/botorch/docs/next  # don't need this
+  mv botorch-main/website/build/botorch new-site
   mv botorch-gh-pages/v new-site/v
 
   # Build new version of site (to be placed in v/$VERSION/)
   # the only thing that changes here is the baseUrl (for nav purposes)
   # we build this now so that in the future, we can just bump version and not move
   # previous stable to versions
-  cd botorch-master/website || exit
+  cd botorch-main/website || exit
 
   # Replace baseUrl (set to /v/$VERSION/) & disable Algolia
   CONFIG_FILE=$(fullpath "siteConfig.js")
@@ -207,7 +211,7 @@ else
   # newer versions. This is the only part of the old versions that
   # needs to be updated when a new version is built.
   cd "${WORK_DIR}" || exit
-  python3 botorch-master/scripts/update_versions_html.py -p "${WORK_DIR}"
+  python3 botorch-main/scripts/update_versions_html.py -p "${WORK_DIR}"
 
   # move contents of newsite to botorch-gh-pages, preserving commit history
   rm -rfv ./botorch-gh-pages/*
